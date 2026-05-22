@@ -6,11 +6,11 @@
 // 	// Year range (use last 2 digits: 16 = 2016, 25 = 2025)
 // 	startYear: 17,        // Start year
 // 	maxYear: 25,          // End year (will scrape all years from start to max)
-	
+
 // 	// How many consecutive "not found" cases before moving to next year
 // 	// Recommended: 100 for production, 10 for testing
 // 	maxConsecutiveSkips: 500,
-	
+
 // 	// Starting case number (usually 1)
 // 	startNumber: 1
 // };
@@ -38,7 +38,7 @@ try {
 // DO NOT EDIT BELOW THIS LINE
 // ============================================================
 
-const { scrapeECHRApplication } = require('./improved-scraper');
+const { scrapeECHRApplication, createBrowser } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
@@ -48,18 +48,18 @@ const { log } = require('./debug');
 class MonthlyECHRScraper {
 	constructor(config = {}) {
 		this.d1 = new D1Adapter('echr-db');
-		
+		this.browser = null;
 		// Configuration
 		this.startYear = config.startYear || 16;
 		this.maxYear = config.maxYear || 26;
 		this.maxConsecutiveSkips = config.maxConsecutiveSkips || 100;
 		this.startNumber = config.startNumber || 1;
-		
+
 		// Batch configuration
 		this.BATCH_ATTEMPTS = 250; // Write after every 100 scrape attempts
 		this.batchQueue = []; // Cases waiting to be written
 		this.attemptCounter = 0; // Count scrape attempts
-		
+
 		// Stats
 		this.stats = {
 			found: 0,
@@ -78,15 +78,15 @@ class MonthlyECHRScraper {
 			log('\n   ℹ️  No cases to write in this batch', true);
 			return;
 		}
-		
+
 		log(`\n🚀 Writing batch of ${this.batchQueue.length} cases to D1...`, true);
 		log('='.repeat(60), true);
-		
+
 		const result = await this.d1.saveBatch(this.batchQueue);
-		
+
 		log(`\n✅ Batch complete: ${result.success} saved, ${result.failed} errors`, true);
 		log('='.repeat(60), true);
-		
+
 		// Clear the queue and reset counter
 		this.batchQueue = [];
 		this.attemptCounter = 0;
@@ -102,81 +102,92 @@ class MonthlyECHRScraper {
 		log(`Max consecutive skips: ${this.maxConsecutiveSkips}`, true);
 		log('='.repeat(60), true);
 
-		let currentYear = this.startYear;
-		let currentNumber = this.startNumber;
+		// Launch browser ONCE for the entire run
+		this.browser = await createBrowser();
 
-		while (currentYear <= this.maxYear) {
-			let consecutiveSkips = 0;
+		try {
+			let currentYear = this.startYear;
+			let currentNumber = this.startNumber;
 
-			log(`\n📅 Processing year: 20${currentYear}`, true);
-			log('-'.repeat(60), true);
+			while (currentYear <= this.maxYear) {
+				let consecutiveSkips = 0;
 
-			while (consecutiveSkips < this.maxConsecutiveSkips) {
-				this.stats.totalChecked++;
-				log(`\n[Check #${this.stats.totalChecked}] ${currentNumber}/${currentYear}`);
+				log(`\n📅 Processing year: 20${currentYear}`, true);
+				log('-'.repeat(60), true);
 
-				try {
-					// Increment attempt counter
-					this.attemptCounter++;
-					
-					// Scrape the case
-					const data = await scrapeECHRApplication(currentNumber, currentYear);
+				while (consecutiveSkips < this.maxConsecutiveSkips) {
+					this.stats.totalChecked++;
+					log(`\n[Check #${this.stats.totalChecked}] ${currentNumber}/${currentYear}`);
 
-					if (data) {
-						// Found - add to batch queue
-						this.batchQueue.push(data);
-						this.stats.found++;
-						consecutiveSkips = 0; // Reset counter
-						
-						log(`   📦 Added to queue (${this.batchQueue.length} cases | ${this.attemptCounter}/250 attempts)`, true);
-					} else {
-						// Not found - increment skip counter
+					try {
+						// Increment attempt counter
+						this.attemptCounter++;
+
+						// Scrape the case (reusing the shared browser)
+						const data = await scrapeECHRApplication(this.browser, currentNumber, currentYear);
+
+						if (data) {
+							// Found - add to batch queue
+							this.batchQueue.push(data);
+							this.stats.found++;
+							consecutiveSkips = 0; // Reset counter
+
+							log(`   📦 Added to queue (${this.batchQueue.length} cases | ${this.attemptCounter}/250 attempts)`, true);
+						} else {
+							// Not found - increment skip counter
+							consecutiveSkips++;
+							this.stats.notFound++;
+							log(`   ⚠️  Skips: ${consecutiveSkips}/${this.maxConsecutiveSkips} | Attempts: ${this.attemptCounter}/250`, true);
+						}
+
+						// Write batch after 100 attempts (regardless of success/failure)
+						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
+							await this.flushBatch();
+						}
+
+					} catch (error) {
+						log(`   ❌ Error: ${error.message}`, true);
+						this.stats.errors++;
 						consecutiveSkips++;
-						this.stats.notFound++;
-						log(`   ⚠️  Skips: ${consecutiveSkips}/${this.maxConsecutiveSkips} | Attempts: ${this.attemptCounter}/250`, true);
-					}
-					
-					// Write batch after 100 attempts (regardless of success/failure)
-					if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
-						await this.flushBatch();
+						this.attemptCounter++;
+
+						// Still check if we need to flush
+						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
+							await this.flushBatch();
+						}
 					}
 
-				} catch (error) {
-					log(`   ❌ Error: ${error.message}`, true);
-					this.stats.errors++;
-					consecutiveSkips++;
-					this.attemptCounter++;
-					
-					// Still check if we need to flush
-					if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
-						await this.flushBatch();
+					currentNumber++;
+
+					// Rate limiting
+					await this.sleep(250);
+
+					// Progress update every 25 cases
+					if (this.stats.totalChecked % 25 === 0) {
+						this.printProgress();
 					}
 				}
 
-				currentNumber++;
+				// Flush any remaining cases before moving to next year
+				await this.flushBatch();
+				// Move to next year
+				log(`\n⏭️  Max consecutive skips reached for year ${currentYear}`, true);
+				log(`   Moving to next year...\n`, true);
 
-				// Rate limiting
-				await this.sleep(0);
-
-				// Progress update every 25 cases
-				if (this.stats.totalChecked % 25 === 0) {
-					this.printProgress();
-				}
+				currentYear++;
+				currentNumber = 1; // Reset to 1 for new year
 			}
 
-			// Flush any remaining cases before moving to next year
+			// Flush any remaining cases at the end
 			await this.flushBatch();
-			// Move to next year
-			log(`\n⏭️  Max consecutive skips reached for year ${currentYear}`, true);
-			log(`   Moving to next year...\n`, true);
-			
-			currentYear++;
-			currentNumber = 1; // Reset to 1 for new year
+			this.printFinalStats();
+		} finally {
+			// Always close the browser, even if an error occurred
+			if (this.browser) {
+				log('\n🌐 Closing browser...', true);
+				await this.browser.close();
+			}
 		}
-
-		// Flush any remaining cases at the end
-		await this.flushBatch();
-		this.printFinalStats();
 	}
 
 	/**
@@ -197,8 +208,8 @@ class MonthlyECHRScraper {
 	 * Print final statistics
 	 */
 	printFinalStats() {
-		const successRate = this.stats.totalChecked > 0 
-			? ((this.stats.found / this.stats.totalChecked) * 100).toFixed(2) 
+		const successRate = this.stats.totalChecked > 0
+			? ((this.stats.found / this.stats.totalChecked) * 100).toFixed(2)
 			: 0;
 
 		log(`\n${'='.repeat(60)}`, true);
@@ -229,7 +240,7 @@ async function main() {
 
 	// Wait 10 seconds so user can review config
 	await new Promise(resolve => setTimeout(resolve, 5000));
-	
+
 	const scraper = new MonthlyECHRScraper(CONFIG);
 	await scraper.run();
 }

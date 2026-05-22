@@ -11,7 +11,7 @@
  */
 
 require('dotenv').config();
-const { scrapeECHRApplication } = require('./improved-scraper');
+const { scrapeECHRApplication, createBrowser } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
@@ -21,7 +21,8 @@ class WeeklyECHRScraper {
 		// Import API is only used in monthly scraper for batch operations
 		this.d1 = new D1Adapter(databaseName);
 		this.databaseName = databaseName;
-		
+		this.browser = null;
+
 		// Stats
 		this.stats = {
 			total: 0,
@@ -37,7 +38,7 @@ class WeeklyECHRScraper {
 	 */
 	async getSubscribedCases() {
 		log('\n📋 Fetching subscribed cases from database...', true);
-		
+
 		// TESTING MODE: Only get 3 cases
 		// Remove LIMIT when ready for full run
 		const sql = `
@@ -51,22 +52,22 @@ class WeeklyECHRScraper {
 			AND a.is_closed = 0
 			ORDER BY s.application_number
 		`;
-		
+
 		try {
 			const result = this.d1.executeSQL(sql);
-			
+
 			// Parse the JSON result from wrangler
 			const jsonMatch = result.match(/\[[\s\S]*\]/);
 			if (!jsonMatch) {
 				throw new Error('Could not parse database response');
 			}
-			
+
 			const data = JSON.parse(jsonMatch[0]);
 			const cases = data[0]?.results || [];
-			
+
 			log(`✅ Found ${cases.length} subscribed cases to check (TESTING MODE)\n`, true);
 			return cases;
-			
+
 		} catch (error) {
 			log(`❌ Error fetching subscribed cases: ${error.message}`, true);
 			throw error;
@@ -95,60 +96,71 @@ class WeeklyECHRScraper {
 		log(`\n📊 Processing ${subscribedCases.length} cases...`, true);
 		log('-'.repeat(60), true);
 
-		// Process each case
-		for (let i = 0; i < subscribedCases.length; i++) {
-			const caseInfo = subscribedCases[i];
-			const progress = `[${i + 1}/${subscribedCases.length}]`;
-			
-			log(`\n${progress} Checking: ${caseInfo.application_number}`, true);
-			log(`   Current event: ${caseInfo.current_event || 'None'}`, true);
+		// Launch browser ONCE for the entire run
+		this.browser = await createBrowser();
 
-			try {
-				// Parse application number (format: "12345/21")
-				const [number, year] = caseInfo.application_number.split('/');
-				
-				// Scrape the case
-				const data = await scrapeECHRApplication(number, year);
+		try {
+			// Process each case
+			for (let i = 0; i < subscribedCases.length; i++) {
+				const caseInfo = subscribedCases[i];
+				const progress = `[${i + 1}/${subscribedCases.length}]`;
 
-				if (data) {
-					// Check if event changed
-					const newEvent = data.lastMajorEvent;
-					const hasChanged = newEvent !== caseInfo.current_event;
-					
-					if (hasChanged) {
-						log(`   🔔 EVENT CHANGED!`, true);
-						log(`   Old: ${caseInfo.current_event}`, true);
-						log(`   New: ${newEvent}`, true);
-						this.stats.updated++;
+				log(`\n${progress} Checking: ${caseInfo.application_number}`, true);
+				log(`   Current event: ${caseInfo.current_event || 'None'}`, true);
+
+				try {
+					// Parse application number (format: "12345/21")
+					const [number, year] = caseInfo.application_number.split('/');
+
+					// Scrape the case (reusing the shared browser)
+					const data = await scrapeECHRApplication(this.browser, number, year);
+
+					if (data) {
+						// Check if event changed
+						const newEvent = data.lastMajorEvent;
+						const hasChanged = newEvent !== caseInfo.current_event;
+
+						if (hasChanged) {
+							log(`   🔔 EVENT CHANGED!`, true);
+							log(`   Old: ${caseInfo.current_event}`, true);
+							log(`   New: ${newEvent}`, true);
+							this.stats.updated++;
+						} else {
+							log(`   ✓ No change`, true);
+							this.stats.unchanged++;
+						}
+
+						// Save to database (always update last_checked_date)
+						await this.d1.saveApplication(data);
+
 					} else {
-						log(`   ✓ No change`, true);
-						this.stats.unchanged++;
+						// Case not found (maybe removed from ECHR website?)
+						log(`   ⚠️  Not found on ECHR website`, true);
+						this.stats.notFound++;
+
+						// Mark as not found in database
+						await this.d1.markAsNotFound(number, year);
 					}
-					
-					// Save to database (always update last_checked_date)
-					await this.d1.saveApplication(data);
-					
-				} else {
-					// Case not found (maybe removed from ECHR website?)
-					log(`   ⚠️  Not found on ECHR website`, true);
-					this.stats.notFound++;
-					
-					// Mark as not found in database
-					await this.d1.markAsNotFound(number, year);
+
+				} catch (error) {
+					log(`   ❌ Error: ${error.message}`, true);
+					this.stats.errors++;
 				}
 
-			} catch (error) {
-				log(`   ❌ Error: ${error.message}`, true);
-				this.stats.errors++;
+				// Rate limiting - be nice to ECHR servers
+				// Wait 500ms between requests
+				await this.sleep(300);
 			}
 
-			// Rate limiting - be nice to ECHR servers
-			// Wait 500ms between requests
-			await this.sleep(500);
+			// Print final stats
+			this.printStats();
+		} finally {
+			// Always close the browser, even if an error occurred
+			if (this.browser) {
+				log('\n🌐 Closing browser...', true);
+				await this.browser.close();
+			}
 		}
-
-		// Print final stats
-		this.printStats();
 	}
 
 	/**
@@ -177,10 +189,10 @@ class WeeklyECHRScraper {
 async function main() {
 	// Use dev database for testing
 	// Change to 'echr-db' when ready for production
-	const databaseName = process.env.DATABASE_NAME || 'echr-db-local';
-	
+	const databaseName = process.env.DATABASE_NAME || 'echr-db';
+
 	console.log(`\n🗄️  Using database: ${databaseName}`);
-	
+
 	const scraper = new WeeklyECHRScraper(databaseName);
 	await scraper.run();
 }

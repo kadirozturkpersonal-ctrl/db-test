@@ -74,6 +74,15 @@ class D1ImportAPI {
 			const uploadUrl = uploadData.result.upload_url;
 			const filename = uploadData.result.filename;
 
+			// Cache hit: Cloudflare recognised this exact SQL (same etag) and
+			// already imported it. No upload_url is returned in that case.
+			// See: https://developers.cloudflare.com/d1/tutorials/import-to-d1-with-rest-api/
+			if (!uploadUrl) {
+				log('   ⚡ Cache hit — Cloudflare already imported this exact SQL.', true);
+				log('   ✅ Import complete (from cache)!', true);
+				return true;
+			}
+
 			log('   ☁️  Uploading to R2...', true);
 
 			// 3. Upload to R2

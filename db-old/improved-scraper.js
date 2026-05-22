@@ -1,43 +1,46 @@
-const { chromium } = require('playwright');
+const { chromium: rawChromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { log } = require('./debug');
 
+// Apply stealth plugin once when module loads
+rawChromium.use(StealthPlugin());
+const chromium = rawChromium;
+
 /**
- * Scrapes a single ECHR application page
- * Returns null if not found, otherwise returns complete data
+ * Create a reusable browser instance.
+ * Caller is responsible for calling browser.close() when done.
  */
-async function scrapeECHRApplication(applicationNumber, applicationYear) {
+async function createBrowser() {
+	log('🌐 Launching browser (will be reused for all cases)...', true);
+	return await chromium.launch({
+		headless: true,
+		timeout: 30000
+	});
+}
+
+/**
+ * Scrapes a single ECHR application page using a shared browser.
+ * Returns null if not found, otherwise returns complete data.
+ *
+ * @param {import('playwright').Browser} browser - Shared browser instance
+ * @param {number|string} applicationNumber - Case number
+ * @param {number|string} applicationYear - Case year (last 2 digits)
+ */
+async function scrapeECHRApplication(browser, applicationNumber, applicationYear) {
 	const url = `https://app.echr.coe.int/SOP/en-GB/application?number=${applicationNumber}%2F${applicationYear}`;
-	
+
 	log(`🔍 Checking: ${applicationNumber}/${applicationYear}`, true);
 
-	const browser = await chromium.launch({ 
-		headless: true,
-		timeout: 30000 
-	});
-	
+	// Fresh context per case (isolates cookies/storage between cases)
+	const context = await browser.newContext();
+	const page = await context.newPage();
+
 	try {
-		const context = await browser.newContext();
-		const page = await context.newPage();
-
 		// Navigate to the URL
-		// await page.goto(url, { 
-		// 	waitUntil: 'domcontentloaded',
-		// 	timeout: 15000 
-		// });
-
-				// Navigate to the URL
-		const response = await page.goto(url, { 
+		await page.goto(url, {
 			waitUntil: 'domcontentloaded',
-			timeout: 15000 
+			timeout: 15000
 		});
-
-		// DEBUG: log response status + page content
-		console.log('STATUS:', response?.status());
-		console.log('FINAL URL:', page.url());
-
-		const html = await page.content();
-		console.log('PAGE HTML:', html);
-		// ////////////////////////////////
 
 		// Check if ResultPanel exists (page loaded successfully)
 		const resultPanelExists = await page.$('#ResultPanel');
@@ -56,35 +59,26 @@ async function scrapeECHRApplication(applicationNumber, applicationYear) {
 				return element ? element.textContent.trim() : null;
 			};
 
-			// 1. Application Number
 			const applicationNumber = getText('#ApplicationNumber p');
-
-			// 2. Application Title
 			const applicationTitle = getText('#ApplicationTitle p');
-
-			// 3. Date of Introduction
 			const dateIntroduction = getText('#DateIntroduction p');
-
-			// 4. Representative
 			const representant = getText('#Representant p');
 
-			// 5. List of Major Events (this is the MAIN source of truth)
 			const majorEventsList = [];
 			const rows = document.querySelectorAll('#MajorEventsList tbody tr');
-			
+
 			rows.forEach(row => {
 				const description = row.querySelector('td:nth-child(1)')?.textContent.trim();
 				const eventDate = row.querySelector('td:nth-child(2)')?.textContent.trim();
-				
+
 				if (description && eventDate) {
-					majorEventsList.push({ 
+					majorEventsList.push({
 						description: description,
-						eventDate: eventDate 
+						eventDate: eventDate
 					});
 				}
 			});
 
-			// 6. Last Major Event (get from the LAST item in the list)
 			let lastMajorEvent = null;
 			let lastMajorEventDate = null;
 
@@ -101,7 +95,7 @@ async function scrapeECHRApplication(applicationNumber, applicationYear) {
 				representant,
 				lastMajorEvent,
 				lastMajorEventDate,
-				majorEventsList  // Full list with ALL events
+				majorEventsList
 			};
 		});
 
@@ -118,15 +112,16 @@ async function scrapeECHRApplication(applicationNumber, applicationYear) {
 		log(`   📋 Events: ${data.majorEventsList.length}`);
 		log(`   🔔 Last Event: ${data.lastMajorEvent || 'N/A'}`);
 		log(`   📆 Last Event Date: ${data.lastMajorEventDate || 'N/A'}`);
-		
+
 		return data;
 
 	} catch (error) {
 		log(`   ❌ Error: ${error.message}`, true);
 		return null;
 	} finally {
-		await browser.close();
+		// Only close the context (cheap), NOT the browser
+		await context.close();
 	}
 }
 
-module.exports = { scrapeECHRApplication };
+module.exports = { scrapeECHRApplication, createBrowser };

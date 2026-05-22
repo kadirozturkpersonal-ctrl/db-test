@@ -11,6 +11,8 @@
   "dependencies": {
     "dotenv": "^17.2.3",
     "playwright": "^1.52.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "wrangler": "^4.19.1"
   }
 }
