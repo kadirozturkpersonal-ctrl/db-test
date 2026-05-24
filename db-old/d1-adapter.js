@@ -8,7 +8,12 @@ const { D1ImportAPI } = require('./d1-import-api');
 class D1Adapter {
     constructor(databaseName = 'echr-db') {
         this.databaseName = databaseName;
-        this.databaseId = '141a3109-a007-4ba6-8ead-bc9649276011';
+        this.databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID;
+
+        if (!this.databaseId) {
+            throw new Error('CLOUDFLARE_D1_DATABASE_ID secret is required');
+        }
+
         // Representative cache: { name: id }
         this.repCache = new Map();
         this.cacheCounter = 0;
@@ -383,7 +388,8 @@ class D1Adapter {
                     ...process.env,
                     // Pass Cloudflare credentials from environment
                     CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
-                    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID
+                    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
+                    CLOUDFLARE_D1_DATABASE_ID: process.env.CLOUDFLARE_D1_DATABASE_ID
                 }
             });
 
@@ -498,8 +504,8 @@ class D1Adapter {
     }
 
     /**
-      * Save complete application data to D1 (OPTIMIZED WITHOUT TRANSACTIONS)
-      */
+     * Save complete application data to D1 (OPTIMIZED WITHOUT TRANSACTIONS)
+     */
     async saveApplication(data) {
         log(`\n💾 Saving to D1: ${data.applicationNumber}`);
 
@@ -689,7 +695,6 @@ class D1Adapter {
         return sqlStatements.join('\n');
     }
 
-
     /**
      * Save multiple cases at once using Import API (OPTIMIZED VERSION)
      */
@@ -856,17 +861,17 @@ class D1Adapter {
 
         try {
             const sql = `
-				UPDATE applications 
-				SET 
-					not_found_count = not_found_count + 1,
-					last_checked_date = DATE('now'),
-					skip_scraping = CASE 
-						WHEN not_found_count + 1 >= 60 THEN 1 
-						ELSE skip_scraping 
-					END,
-					updated_at = CURRENT_TIMESTAMP
-				WHERE application_number = '${fullNumber}'
-			`;
+                UPDATE applications 
+                SET 
+                    not_found_count = not_found_count + 1,
+                    last_checked_date = DATE('now'),
+                    skip_scraping = CASE 
+                        WHEN not_found_count + 1 >= 60 THEN 1 
+                        ELSE skip_scraping 
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE application_number = '${fullNumber}'
+            `;
 
             this.executeSQL(sql);
             log('   ✅ Updated not_found_count\n', true);
