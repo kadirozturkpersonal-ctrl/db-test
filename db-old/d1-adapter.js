@@ -8,6 +8,7 @@ const { D1ImportAPI } = require('./d1-import-api');
 class D1Adapter {
     constructor(databaseName = 'echr-db') {
         this.databaseName = databaseName;
+        this.databaseId = '141a3109-a007-4ba6-8ead-bc9649276011';
         // Representative cache: { name: id }
         this.repCache = new Map();
         this.cacheCounter = 0;
@@ -16,7 +17,7 @@ class D1Adapter {
         // Initialize D1 Import API if credentials available
         const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
         const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-        const databaseId = '141a3109-a007-4ba6-8ead-bc9649276011';
+        const databaseId = this.databaseId;
 
         if (accountId && apiToken) {
             this.importAPI = new D1ImportAPI(accountId, databaseId, apiToken);
@@ -28,13 +29,119 @@ class D1Adapter {
     }
 
     /**
+     * Query D1 through the REST API when credentials are available.
+     */
+    async querySQL(sql, params = []) {
+        const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+        const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+
+        if (!accountId || !apiToken) {
+            const result = this.executeSQL(sql);
+            const rows = [];
+
+            for (const match of result.matchAll(/\{[^{}]*\}/g)) {
+                try {
+                    rows.push(JSON.parse(match[0]));
+                } catch {
+                    // Ignore non-row JSON fragments from wrangler output.
+                }
+            }
+
+            return rows;
+        }
+
+        const response = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/d1/database/${encodeURIComponent(this.databaseId)}/query`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${apiToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sql, params })
+            }
+        );
+        const payload = await response.json().catch(() => null);
+        const apiErrors = payload?.errors?.map(error => error.message).filter(Boolean);
+
+        if (!response.ok || payload?.success === false) {
+            throw new Error(apiErrors?.join('; ') || `Cloudflare D1 HTTP ${response.status}`);
+        }
+
+        const firstResult = payload?.result?.[0];
+        if (!firstResult) {
+            return [];
+        }
+
+        if (firstResult.success === false) {
+            throw new Error(firstResult.error || 'Cloudflare D1 query failed');
+        }
+
+        return firstResult.results || [];
+    }
+
+    /**
+     * Load application numbers that reached a final successful or unsuccessful outcome.
+     */
+    async loadFinalizedApplicationNumbers() {
+        const finalEvents = [
+            'Decision to strike a case out of the list after a friendly settlement',
+            'Decision to strike a case out of the list after a unilateral declaration',
+            'Judgment on merits and just satisfaction final: case is finished',
+            'Judgment on just satisfaction final: case is finished',
+            'Decision to declare a case inadmissible',
+            'Decision to declare a case inadmissible after reopening',
+            'Decision to strike a case out of the list of cases'
+        ];
+        const finalized = new Set();
+        const limit = 10000;
+        let offset = 0;
+        const escapeSQL = (str) => str.replace(/'/g, "''");
+        const finalEventValues = finalEvents.map(event => `'${escapeSQL(event)}'`).join(', ');
+
+        for (;;) {
+            const rows = await this.querySQL(
+                `
+                    SELECT application_number
+                    FROM applications
+                    WHERE application_number IS NOT NULL
+                      AND TRIM(application_number) <> ''
+                      AND (
+                          is_closed = 1
+                          OR last_major_event IN (${finalEventValues})
+                          OR LOWER(last_major_event) LIKE 'decision to strike a case out of the list%'
+                      )
+                    ORDER BY id ASC
+                    LIMIT ${limit} OFFSET ${offset}
+                `
+            );
+
+            for (const row of rows) {
+                if (row.application_number) {
+                    finalized.add(String(row.application_number).trim());
+                }
+            }
+
+            if (rows.length < limit) {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        return finalized;
+    }
+
+    /**
      * Check if case should be marked as closed based on last event
      */
     isCaseClosed(lastMajorEvent) {
         if (!lastMajorEvent) return false;
 
         const eventLower = lastMajorEvent.toLowerCase();
-        return eventLower.includes('finished') || eventLower.includes('inadmissible');
+        return eventLower.includes('finished')
+            || eventLower.includes('inadmissible')
+            || eventLower.startsWith('decision to strike a case out of the list');
     }
 
     /**

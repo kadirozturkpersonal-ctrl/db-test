@@ -70,6 +70,7 @@ class MonthlyECHRScraper {
 		this.stopNewAttemptsAt = this.startedAt + this.maxRuntimeMs - this.safeStopBufferMs;
 		this.hardStopAt = this.startedAt + this.maxRuntimeMs;
 		this.state = null;
+		this.finalizedApplicationNumbers = new Set();
 
 		// Batch configuration
 		this.BATCH_ATTEMPTS = 250; // Write after every 250 scrape attempts
@@ -81,7 +82,8 @@ class MonthlyECHRScraper {
 			found: 0,
 			notFound: 0,
 			errors: 0,
-			totalChecked: 0
+			totalChecked: 0,
+			skippedFinalized: 0
 		};
 	}
 
@@ -198,6 +200,21 @@ class MonthlyECHRScraper {
 		return Date.now() >= this.stopNewAttemptsAt;
 	}
 
+	async loadFinalizedApplicationNumbers() {
+		try {
+			this.finalizedApplicationNumbers = await this.d1.loadFinalizedApplicationNumbers();
+			log(`   🧭 Finalized applications loaded for skip: ${this.finalizedApplicationNumbers.size}`, true);
+		} catch (error) {
+			this.finalizedApplicationNumbers = new Set();
+			log(`   ⚠️  Finalized skip list could not be loaded: ${error.message}`, true);
+			log('   Continuing without finalized-case skips for this run.', true);
+		}
+	}
+
+	isFinalizedApplication(applicationNumber) {
+		return this.finalizedApplicationNumbers.has(applicationNumber);
+	}
+
 
 	/**
 	 * Write all queued cases to database using Import API
@@ -234,6 +251,7 @@ class MonthlyECHRScraper {
 		log('='.repeat(60), true);
 		this.loadState();
 		this.saveState('run-start');
+		await this.loadFinalizedApplicationNumbers();
 
 		// Launch browser ONCE for the entire run
 		this.browser = await createBrowser();
@@ -265,9 +283,23 @@ class MonthlyECHRScraper {
 					const currentYear = this.state.currentYear;
 					const currentNumber = this.state.currentNumber;
 					const echrYear = this.toECHRYear(currentYear);
+					const applicationNumber = `${currentNumber}/${echrYear}`;
+
+					if (this.isFinalizedApplication(applicationNumber)) {
+						this.stats.skippedFinalized++;
+						this.state.currentNumber = currentNumber + 1;
+						log(`\n[Skip #${this.stats.skippedFinalized}] ${applicationNumber} is finalized; skipping SOP check`, true);
+
+						if (this.stats.skippedFinalized % this.BATCH_ATTEMPTS === 0) {
+							this.saveState('finalized-skip');
+							this.printProgress();
+						}
+
+						continue;
+					}
 
 					this.stats.totalChecked++;
-					log(`\n[Check #${this.stats.totalChecked}] ${currentNumber}/${echrYear}`);
+					log(`\n[Check #${this.stats.totalChecked}] ${applicationNumber}`);
 
 					try {
 						// Increment attempt counter
@@ -361,6 +393,7 @@ class MonthlyECHRScraper {
 		log(`Total checked: ${this.stats.totalChecked}`, true);
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
+		log(`⏭️  Skipped finalized: ${this.stats.skippedFinalized}`, true);
 		log(`⚠️  Errors: ${this.stats.errors}`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
 	}
@@ -379,6 +412,7 @@ class MonthlyECHRScraper {
 		log(`Total checked: ${this.stats.totalChecked}`, true);
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
+		log(`⏭️  Skipped finalized: ${this.stats.skippedFinalized}`, true);
 		log(`⚠️  Errors: ${this.stats.errors}`, true);
 		log(`📈 Success rate: ${successRate}%`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
