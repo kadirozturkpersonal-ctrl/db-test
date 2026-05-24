@@ -16,32 +16,33 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6 hours max - GitHub free tier limit
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      
+
       - name: Install dependencies
         working-directory: ./db-old
         run: npm ci
-      
+
       - name: Install Playwright browsers
         working-directory: ./db-old
         run: npx playwright install chromium
-      
+
       - name: Run scraper
         working-directory: ./db-old
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
           MAX_CONSECUTIVE_EMPTY: '500'
           MAX_RUNTIME_MINUTES: '330'
           SAFE_STOP_BUFFER_MINUTES: '5'
@@ -61,7 +62,7 @@ jobs:
           else
             echo "No checkpoint changes to persist."
           fi
-      
+
       - name: Upload logs (if job fails)
         if: failure()
         uses: actions/upload-artifact@v4
