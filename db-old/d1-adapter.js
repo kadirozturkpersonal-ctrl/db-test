@@ -13,6 +13,7 @@ class D1Adapter {
         this.repCache = new Map();
         this.cacheCounter = 0;
         this.CACHE_FLUSH_INTERVAL = 10; // Flush cache every 10 cases
+        this.sopNoInfoTrackingReady = false;
 
         // Initialize D1 Import API if credentials available
         const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
@@ -78,6 +79,226 @@ class D1Adapter {
         }
 
         return firstResult.results || [];
+    }
+
+    escapeSQL(str) {
+        return String(str).replace(/'/g, "''");
+    }
+
+    async ensureSOPNoInfoTracking() {
+        if (this.sopNoInfoTrackingReady) {
+            return;
+        }
+
+        await this.querySQL(`
+            CREATE TABLE IF NOT EXISTS sop_no_info_tracking (
+                application_number TEXT PRIMARY KEY,
+                first_not_found_date TEXT NOT NULL,
+                last_not_found_date TEXT NOT NULL,
+                not_found_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                administrative_rejection_date TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await this.querySQL(`
+            CREATE INDEX IF NOT EXISTS idx_sop_no_info_tracking_status
+            ON sop_no_info_tracking(status)
+        `);
+
+        await this.querySQL(`
+            CREATE INDEX IF NOT EXISTS idx_sop_no_info_tracking_first_not_found
+            ON sop_no_info_tracking(first_not_found_date)
+        `);
+
+        this.sopNoInfoTrackingReady = true;
+    }
+
+    async reconcileSOPNoInfoTracking(graceDays = 365) {
+        await this.ensureSOPNoInfoTracking();
+        const days = Math.max(1, parseInt(graceDays, 10) || 365);
+
+        await this.querySQL(`
+            DELETE FROM sop_no_info_tracking
+            WHERE EXISTS (
+                SELECT 1
+                FROM applications
+                WHERE applications.application_number = sop_no_info_tracking.application_number
+            )
+        `);
+
+        await this.querySQL(`
+            UPDATE sop_no_info_tracking
+            SET
+                status = 'administrative_rejection',
+                administrative_rejection_date = COALESCE(administrative_rejection_date, DATE('now')),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'pending'
+              AND DATE(first_not_found_date, '+${days} days') <= DATE('now')
+        `);
+    }
+
+    async loadKnownApplicationNumbers() {
+        const known = new Set();
+        const limit = 10000;
+        let offset = 0;
+
+        for (;;) {
+            const rows = await this.querySQL(`
+                SELECT application_number
+                FROM applications
+                WHERE application_number IS NOT NULL
+                  AND TRIM(application_number) <> ''
+                ORDER BY id ASC
+                LIMIT ${limit} OFFSET ${offset}
+            `);
+
+            for (const row of rows) {
+                if (row.application_number) {
+                    known.add(String(row.application_number).trim());
+                }
+            }
+
+            if (rows.length < limit) {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        return known;
+    }
+
+    async loadAdministrativelyRejectedApplicationNumbers() {
+        await this.ensureSOPNoInfoTracking();
+        const rejected = new Set();
+        const limit = 10000;
+        let offset = 0;
+
+        for (;;) {
+            const rows = await this.querySQL(`
+                SELECT application_number
+                FROM sop_no_info_tracking
+                WHERE status = 'administrative_rejection'
+                ORDER BY application_number ASC
+                LIMIT ${limit} OFFSET ${offset}
+            `);
+
+            for (const row of rows) {
+                if (row.application_number) {
+                    rejected.add(String(row.application_number).trim());
+                }
+            }
+
+            if (rows.length < limit) {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        return rejected;
+    }
+
+    buildClearSOPNoInfoSQL(applicationNumbers) {
+        if (!this.sopNoInfoTrackingReady || !applicationNumbers || applicationNumbers.length === 0) {
+            return '';
+        }
+
+        const values = [...new Set(applicationNumbers)]
+            .filter(Boolean)
+            .map(number => `'${this.escapeSQL(number)}'`);
+
+        if (values.length === 0) {
+            return '';
+        }
+
+        return `
+            DELETE FROM sop_no_info_tracking
+            WHERE application_number IN (${values.join(', ')});
+        `;
+    }
+
+    async clearSOPNoInfoCandidates(applicationNumbers) {
+        const sql = this.buildClearSOPNoInfoSQL(applicationNumbers);
+        if (!sql) {
+            return;
+        }
+
+        await this.querySQL(sql);
+    }
+
+    async saveSOPNoInfoBatch(applicationNumbers, graceDays = 365) {
+        if (!applicationNumbers || applicationNumbers.length === 0) {
+            return { success: 0, failed: 0 };
+        }
+
+        try {
+            await this.ensureSOPNoInfoTracking();
+
+            const days = Math.max(1, parseInt(graceDays, 10) || 365);
+            const uniqueNumbers = [...new Set(applicationNumbers)]
+                .filter(Boolean)
+                .map(number => String(number).trim())
+                .filter(Boolean);
+
+            if (uniqueNumbers.length === 0) {
+                return { success: 0, failed: 0 };
+            }
+
+            const values = uniqueNumbers
+                .map(number => `('${this.escapeSQL(number)}', DATE('now'), DATE('now'), 1, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+                .join(',\n                ');
+
+            await this.querySQL(`
+                INSERT INTO sop_no_info_tracking (
+                    application_number,
+                    first_not_found_date,
+                    last_not_found_date,
+                    not_found_count,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES
+                ${values}
+                ON CONFLICT(application_number) DO UPDATE SET
+                    last_not_found_date = DATE('now'),
+                    not_found_count = sop_no_info_tracking.not_found_count + 1,
+                    status = CASE
+                        WHEN sop_no_info_tracking.status = 'administrative_rejection'
+                            THEN sop_no_info_tracking.status
+                        WHEN DATE(sop_no_info_tracking.first_not_found_date, '+${days} days') <= DATE('now')
+                            THEN 'administrative_rejection'
+                        ELSE 'pending'
+                    END,
+                    administrative_rejection_date = CASE
+                        WHEN sop_no_info_tracking.status != 'administrative_rejection'
+                            AND DATE(sop_no_info_tracking.first_not_found_date, '+${days} days') <= DATE('now')
+                            THEN DATE('now')
+                        ELSE sop_no_info_tracking.administrative_rejection_date
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+            `);
+
+            const valueList = uniqueNumbers.map(number => `'${this.escapeSQL(number)}'`).join(', ');
+            const rejectedRows = await this.querySQL(`
+                SELECT application_number
+                FROM sop_no_info_tracking
+                WHERE status = 'administrative_rejection'
+                  AND application_number IN (${valueList})
+            `);
+            const administrativeRejected = rejectedRows
+                .map(row => row.application_number && String(row.application_number).trim())
+                .filter(Boolean);
+
+            log(`   📝 No-info tracking saved: ${uniqueNumbers.length}`, true);
+            return { success: uniqueNumbers.length, failed: 0, administrativeRejected };
+        } catch (error) {
+            log(`   ⚠️  Failed to save no-info tracking: ${error.message}`, true);
+            return { success: 0, failed: applicationNumbers.length, administrativeRejected: [] };
+        }
     }
 
     /**
@@ -372,6 +593,7 @@ class D1Adapter {
             `;
 
             this.executeSQL(eventsSQL);
+            await this.clearSOPNoInfoCandidates([data.applicationNumber]);
             log('   🎉 Complete!\n', true);
 
             // Flush cache if needed (every 10 cases)
@@ -614,6 +836,11 @@ class D1Adapter {
         // 3. Combine all SQL statements
         sqlStatements.push(...appStatements);
         sqlStatements.push(...eventStatements);
+
+        const clearNoInfoSQL = this.buildClearSOPNoInfoSQL(casesData.map(data => data.applicationNumber));
+        if (clearNoInfoSQL) {
+            sqlStatements.push(clearNoInfoSQL);
+        }
 
         log(`   📝 Built SQL batch: ${uniqueReps.length} reps, ${casesData.length} cases, ${eventStatements.length / 2} event sets`, true);
 

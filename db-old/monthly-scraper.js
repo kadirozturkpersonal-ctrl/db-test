@@ -6,6 +6,7 @@ const START_YEAR = 2016;
 const DEFAULT_MAX_CONSECUTIVE_EMPTY = 500;
 const DEFAULT_MAX_RUNTIME_MINUTES = 330;
 const DEFAULT_SAFE_STOP_BUFFER_MINUTES = 5;
+const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
 const STATE_VERSION = 1;
 
 function parseNumber(value) {
@@ -31,6 +32,7 @@ function readEnvConfig() {
 		maxRuntimeMinutes: parseNumber(process.env.MAX_RUNTIME_MINUTES),
 		maxRuntimeMs: parseNumber(process.env.MAX_RUNTIME_MS),
 		safeStopBufferMinutes: parseNumber(process.env.SAFE_STOP_BUFFER_MINUTES),
+		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		stateFile: process.env.SCRAPER_STATE_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
@@ -71,10 +73,16 @@ class MonthlyECHRScraper {
 		this.hardStopAt = this.startedAt + this.maxRuntimeMs;
 		this.state = null;
 		this.finalizedApplicationNumbers = new Set();
+		this.knownApplicationNumbers = new Set();
+		this.administrativelyRejectedApplicationNumbers = new Set();
+		this.administrativeRejectionTrackingEnabled = false;
+		this.administrativeRejectionGraceDays =
+			config.administrativeRejectionGraceDays || DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS;
 
 		// Batch configuration
 		this.BATCH_ATTEMPTS = 250; // Write after every 250 scrape attempts
 		this.batchQueue = []; // Cases waiting to be written
+		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
 
 		// Stats
@@ -83,7 +91,10 @@ class MonthlyECHRScraper {
 			notFound: 0,
 			errors: 0,
 			totalChecked: 0,
-			skippedFinalized: 0
+			skippedFinalized: 0,
+			skippedAdministrativeRejected: 0,
+			noInfoTracked: 0,
+			noInfoKnownApplication: 0
 		};
 	}
 
@@ -215,27 +226,109 @@ class MonthlyECHRScraper {
 		return this.finalizedApplicationNumbers.has(applicationNumber);
 	}
 
+	async prepareAdministrativeRejectionTracking() {
+		try {
+			await this.d1.ensureSOPNoInfoTracking();
+			await this.d1.reconcileSOPNoInfoTracking(this.administrativeRejectionGraceDays);
+
+			this.knownApplicationNumbers = await this.d1.loadKnownApplicationNumbers();
+			this.administrativelyRejectedApplicationNumbers =
+				await this.d1.loadAdministrativelyRejectedApplicationNumbers();
+			this.administrativeRejectionTrackingEnabled = true;
+
+			log(`   🗂️  Known SOP applications loaded: ${this.knownApplicationNumbers.size}`, true);
+			log(`   🚫 Administrative rejections loaded for skip: ${this.administrativelyRejectedApplicationNumbers.size}`, true);
+			log(`   ⏳ Administrative rejection grace period: ${this.administrativeRejectionGraceDays} days`, true);
+		} catch (error) {
+			this.knownApplicationNumbers = new Set();
+			this.administrativelyRejectedApplicationNumbers = new Set();
+			this.administrativeRejectionTrackingEnabled = false;
+			log(`   ⚠️  Administrative rejection tracking could not be prepared: ${error.message}`, true);
+			log('   Continuing without administrative-rejection skips for this run.', true);
+		}
+	}
+
+	isKnownApplication(applicationNumber) {
+		return this.knownApplicationNumbers.has(applicationNumber);
+	}
+
+	isAdministrativelyRejectedApplication(applicationNumber) {
+		return this.administrativelyRejectedApplicationNumbers.has(applicationNumber);
+	}
+
+	queueNoInfoIfEligible(applicationNumber) {
+		if (!this.administrativeRejectionTrackingEnabled) {
+			return;
+		}
+
+		if (this.isKnownApplication(applicationNumber)) {
+			this.stats.noInfoKnownApplication++;
+			log('   ℹ️  No SOP info now, but this application already exists in D1; not treating as administrative rejection candidate.', true);
+			return;
+		}
+
+		this.noInfoQueue.push(applicationNumber);
+		this.stats.noInfoTracked++;
+		log(`   📝 No-info candidate queued (${this.noInfoQueue.length}/${this.BATCH_ATTEMPTS})`, true);
+	}
+
+	async flushNoInfoBatch() {
+		if (!this.administrativeRejectionTrackingEnabled || this.noInfoQueue.length === 0) {
+			return;
+		}
+
+		const applicationNumbers = [...new Set(this.noInfoQueue)];
+		this.noInfoQueue = [];
+
+		const result = await this.d1.saveSOPNoInfoBatch(
+			applicationNumbers,
+			this.administrativeRejectionGraceDays
+		);
+
+		if (result.failed > 0) {
+			log(`   ⚠️  No-info tracking had ${result.failed} failed records`, true);
+		}
+
+		if (result.administrativeRejected && result.administrativeRejected.length > 0) {
+			for (const applicationNumber of result.administrativeRejected) {
+				this.administrativelyRejectedApplicationNumbers.add(applicationNumber);
+			}
+			log(`   🚫 Marked administrative rejection after no-info grace period: ${result.administrativeRejected.length}`, true);
+		}
+	}
 
 	/**
 	 * Write all queued cases to database using Import API
 	 */
 	async flushBatch() {
-		if (this.batchQueue.length === 0) {
+		if (this.batchQueue.length === 0 && this.noInfoQueue.length === 0) {
 			log('\n   ℹ️  No cases to write in this batch', true);
 			return;
 		}
 
-		log(`\n🚀 Writing batch of ${this.batchQueue.length} cases to D1...`, true);
+		log(`\n🚀 Writing batch to D1: ${this.batchQueue.length} cases, ${this.noInfoQueue.length} no-info candidates...`, true);
 		log('='.repeat(60), true);
 
-		const result = await this.d1.saveBatch(this.batchQueue);
+		if (this.batchQueue.length > 0) {
+			const casesToSave = this.batchQueue;
+			const result = await this.d1.saveBatch(casesToSave);
+			log(`\n✅ Application batch complete: ${result.success} saved, ${result.failed} errors`, true);
 
-		log(`\n✅ Batch complete: ${result.success} saved, ${result.failed} errors`, true);
-		log('='.repeat(60), true);
+			if (result.success === casesToSave.length) {
+				for (const data of casesToSave) {
+					if (data.applicationNumber) {
+						this.knownApplicationNumbers.add(String(data.applicationNumber).trim());
+					}
+				}
+			}
+		}
+
+		await this.flushNoInfoBatch();
 
 		// Clear the queue and reset counter
 		this.batchQueue = [];
 		this.attemptCounter = 0;
+		log('='.repeat(60), true);
 	}
 
 	/**
@@ -252,6 +345,7 @@ class MonthlyECHRScraper {
 		this.loadState();
 		this.saveState('run-start');
 		await this.loadFinalizedApplicationNumbers();
+		await this.prepareAdministrativeRejectionTracking();
 
 		// Launch browser ONCE for the entire run
 		this.browser = await createBrowser();
@@ -298,6 +392,19 @@ class MonthlyECHRScraper {
 						continue;
 					}
 
+					if (this.isAdministrativelyRejectedApplication(applicationNumber)) {
+						this.stats.skippedAdministrativeRejected++;
+						this.state.currentNumber = currentNumber + 1;
+						log(`\n[Admin reject skip #${this.stats.skippedAdministrativeRejected}] ${applicationNumber} had no SOP info for at least ${this.administrativeRejectionGraceDays} days`, true);
+
+						if (this.stats.skippedAdministrativeRejected % this.BATCH_ATTEMPTS === 0) {
+							this.saveState('administrative-rejection-skip');
+							this.printProgress();
+						}
+
+						continue;
+					}
+
 					this.stats.totalChecked++;
 					log(`\n[Check #${this.stats.totalChecked}] ${applicationNumber}`);
 
@@ -319,6 +426,7 @@ class MonthlyECHRScraper {
 							// Not found - increment empty counter
 							this.state.consecutiveEmpty++;
 							this.stats.notFound++;
+							this.queueNoInfoIfEligible(applicationNumber);
 							log(`   ⚠️  Empty: ${this.state.consecutiveEmpty}/${this.maxConsecutiveEmpty} | Attempts: ${this.attemptCounter}/250`, true);
 						}
 
@@ -394,6 +502,9 @@ class MonthlyECHRScraper {
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
 		log(`⏭️  Skipped finalized: ${this.stats.skippedFinalized}`, true);
+		log(`🚫 Skipped administrative rejections: ${this.stats.skippedAdministrativeRejected}`, true);
+		log(`📝 No-info candidates tracked: ${this.stats.noInfoTracked}`, true);
+		log(`ℹ️  No-info known applications: ${this.stats.noInfoKnownApplication}`, true);
 		log(`⚠️  Errors: ${this.stats.errors}`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
 	}
@@ -413,6 +524,9 @@ class MonthlyECHRScraper {
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
 		log(`⏭️  Skipped finalized: ${this.stats.skippedFinalized}`, true);
+		log(`🚫 Skipped administrative rejections: ${this.stats.skippedAdministrativeRejected}`, true);
+		log(`📝 No-info candidates tracked: ${this.stats.noInfoTracked}`, true);
+		log(`ℹ️  No-info known applications: ${this.stats.noInfoKnownApplication}`, true);
 		log(`⚠️  Errors: ${this.stats.errors}`, true);
 		log(`📈 Success rate: ${successRate}%`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
