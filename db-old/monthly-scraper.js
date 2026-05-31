@@ -80,7 +80,7 @@ class MonthlyECHRScraper {
 			config.administrativeRejectionGraceDays || DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS;
 
 		// Batch configuration
-		this.BATCH_ATTEMPTS = 250; // Write after every 250 scrape attempts
+		this.BATCH_ATTEMPTS = 500; // Write after every 500 scrape attempts
 		this.batchQueue = []; // Cases waiting to be written
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
@@ -421,18 +421,18 @@ class MonthlyECHRScraper {
 							this.stats.found++;
 							this.state.consecutiveEmpty = 0;
 
-							log(`   📦 Added to queue (${this.batchQueue.length} cases | ${this.attemptCounter}/250 attempts)`, true);
+							log(`   📦 Added to queue (${this.batchQueue.length} cases | ${this.attemptCounter}/${this.BATCH_ATTEMPTS} attempts)`, true);
 						} else {
 							// Not found - increment empty counter
 							this.state.consecutiveEmpty++;
 							this.stats.notFound++;
 							this.queueNoInfoIfEligible(applicationNumber);
-							log(`   ⚠️  Empty: ${this.state.consecutiveEmpty}/${this.maxConsecutiveEmpty} | Attempts: ${this.attemptCounter}/250`, true);
+							log(`   ⚠️  Empty: ${this.state.consecutiveEmpty}/${this.maxConsecutiveEmpty} | Attempts: ${this.attemptCounter}/${this.BATCH_ATTEMPTS}`, true);
 						}
 
 						this.state.currentNumber = currentNumber + 1;
 
-						// Write batch after 250 attempts (regardless of success/failure)
+						// Write batch after the configured attempt limit (regardless of success/failure)
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
 							await this.flushBatch();
 							this.saveState('batch-flush');
