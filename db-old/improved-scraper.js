@@ -6,6 +6,25 @@ const { log } = require('./debug');
 rawChromium.use(StealthPlugin());
 const chromium = rawChromium;
 
+const DEFAULT_MAX_RETRIES = 2;
+
+class TemporaryScrapeError extends Error {
+	constructor(message, cause) {
+		super(message);
+		this.name = 'TemporaryScrapeError';
+		this.temporary = true;
+		this.cause = cause;
+	}
+}
+
+function isTemporaryScrapeError(error) {
+	return Boolean(error && error.temporary === true);
+}
+
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 /**
  * Create a reusable browser instance.
  * Caller is responsible for calling browser.close() when done.
@@ -26,7 +45,7 @@ async function createBrowser() {
  * @param {number|string} applicationNumber - Case number
  * @param {number|string} applicationYear - Case year (last 2 digits)
  */
-async function scrapeECHRApplication(browser, applicationNumber, applicationYear) {
+async function scrapeECHRApplicationOnce(browser, applicationNumber, applicationYear) {
 	const url = `https://app.echr.coe.int/SOP/en-GB/application?number=${applicationNumber}%2F${applicationYear}`;
 
 	log(`🔍 Checking: ${applicationNumber}/${applicationYear}`, true);
@@ -42,15 +61,20 @@ async function scrapeECHRApplication(browser, applicationNumber, applicationYear
 			timeout: 15000
 		});
 
-		// Check if ResultPanel exists (page loaded successfully)
-		const resultPanelExists = await page.$('#ResultPanel');
-		if (!resultPanelExists) {
+		// If the SOP result panel never appears, treat it as a real no-info result.
+		const resultPanel = await page.waitForSelector('#ResultPanel', { timeout: 5000 })
+			.catch(error => {
+				if (error.name === 'TimeoutError') {
+					return null;
+				}
+
+				throw error;
+			});
+
+		if (!resultPanel) {
 			log(`   ❌ Not found`);
 			return null;
 		}
-
-		// Wait for the result panel
-		await page.waitForSelector('#ResultPanel', { timeout: 5000 });
 
 		// Extract ALL data from the page
 		const data = await page.evaluate(() => {
@@ -117,11 +141,49 @@ async function scrapeECHRApplication(browser, applicationNumber, applicationYear
 
 	} catch (error) {
 		log(`   ❌ Error: ${error.message}`, true);
-		return null;
+		throw new TemporaryScrapeError(error.message, error);
 	} finally {
 		// Only close the context (cheap), NOT the browser
-		await context.close();
+		await context.close().catch(error => {
+			log(`   ⚠️  Could not close browser context: ${error.message}`, true);
+		});
 	}
 }
 
-module.exports = { scrapeECHRApplication, createBrowser };
+/**
+ * Scrape an application, retrying only temporary technical failures.
+ * Real no-info SOP results still return null without retry.
+ */
+async function scrapeECHRApplication(browser, applicationNumber, applicationYear, options = {}) {
+	const maxRetries = options.maxRetries === undefined
+		? DEFAULT_MAX_RETRIES
+		: Math.max(0, parseInt(options.maxRetries, 10) || 0);
+	const maxAttempts = maxRetries + 1;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			if (attempt > 1) {
+				log(`   🔁 Retry ${attempt - 1}/${maxRetries} for ${applicationNumber}/${applicationYear}`, true);
+			}
+
+			return await scrapeECHRApplicationOnce(browser, applicationNumber, applicationYear);
+		} catch (error) {
+			if (!isTemporaryScrapeError(error) || attempt >= maxAttempts) {
+				throw error;
+			}
+
+			const delayMs = Math.min(8000, 1000 * (2 ** attempt));
+			log(`   ⏳ Temporary scrape error; waiting ${delayMs}ms before retry`, true);
+			await sleep(delayMs);
+		}
+	}
+
+	return null;
+}
+
+module.exports = {
+	scrapeECHRApplication,
+	createBrowser,
+	isTemporaryScrapeError,
+	TemporaryScrapeError
+};

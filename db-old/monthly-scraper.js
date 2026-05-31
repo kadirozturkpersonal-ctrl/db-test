@@ -7,6 +7,7 @@ const DEFAULT_MAX_CONSECUTIVE_EMPTY = 500;
 const DEFAULT_MAX_RUNTIME_MINUTES = 330;
 const DEFAULT_SAFE_STOP_BUFFER_MINUTES = 5;
 const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
+const DEFAULT_MAX_SCRAPE_RETRIES = 2;
 const STATE_VERSION = 1;
 
 function parseNumber(value) {
@@ -33,6 +34,7 @@ function readEnvConfig() {
 		maxRuntimeMs: parseNumber(process.env.MAX_RUNTIME_MS),
 		safeStopBufferMinutes: parseNumber(process.env.SAFE_STOP_BUFFER_MINUTES),
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
+		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
 		stateFile: process.env.SCRAPER_STATE_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
@@ -46,7 +48,7 @@ const CONFIG = {
 // DO NOT EDIT BELOW THIS LINE
 // ============================================================
 
-const { scrapeECHRApplication, createBrowser } = require('./improved-scraper');
+const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
@@ -78,6 +80,9 @@ class MonthlyECHRScraper {
 		this.administrativeRejectionTrackingEnabled = false;
 		this.administrativeRejectionGraceDays =
 			config.administrativeRejectionGraceDays || DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS;
+		this.maxScrapeRetries = config.maxScrapeRetries === undefined
+			? DEFAULT_MAX_SCRAPE_RETRIES
+			: Math.max(0, parseInt(config.maxScrapeRetries, 10) || 0);
 
 		// Batch configuration
 		this.BATCH_ATTEMPTS = 500; // Write after every 500 scrape attempts
@@ -339,6 +344,7 @@ class MonthlyECHRScraper {
 		log('='.repeat(60), true);
 		log(`Year cycle: ${this.startYear} to ${this.cycleEndYear}, then back to ${this.startYear}`, true);
 		log(`Max consecutive empty results: ${this.maxConsecutiveEmpty}`, true);
+		log(`Temporary scrape retries: ${this.maxScrapeRetries}`, true);
 		log(`Safe stop: no new attempts after ${new Date(this.stopNewAttemptsAt).toISOString()}`, true);
 		log(`Hard runtime target: ${new Date(this.hardStopAt).toISOString()}`, true);
 		log('='.repeat(60), true);
@@ -413,7 +419,9 @@ class MonthlyECHRScraper {
 						this.attemptCounter++;
 
 						// Scrape the case (reusing the shared browser)
-						const data = await scrapeECHRApplication(this.browser, currentNumber, echrYear);
+						const data = await scrapeECHRApplication(this.browser, currentNumber, echrYear, {
+							maxRetries: this.maxScrapeRetries
+						});
 
 						if (data) {
 							// Found - add to batch queue
@@ -443,9 +451,13 @@ class MonthlyECHRScraper {
 					} catch (error) {
 						log(`   ❌ Error: ${error.message}`, true);
 						this.stats.errors++;
-						this.state.consecutiveEmpty++;
-						this.attemptCounter++;
 						this.state.currentNumber = currentNumber + 1;
+
+						if (isTemporaryScrapeError(error)) {
+							log('   ℹ️  Temporary scrape error exhausted retries; not counted as empty SOP result.', true);
+						} else {
+							this.state.consecutiveEmpty++;
+						}
 
 						// Still check if we need to flush
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
