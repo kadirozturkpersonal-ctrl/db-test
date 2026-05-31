@@ -99,7 +99,13 @@ class MonthlyECHRScraper {
 			skippedFinalized: 0,
 			skippedAdministrativeRejected: 0,
 			noInfoTracked: 0,
-			noInfoKnownApplication: 0
+			noInfoKnownApplication: 0,
+			d1Saved: 0,
+			d1Failed: 0,
+			noInfoSaved: 0,
+			noInfoFailed: 0,
+			flushes: 0,
+			totalD1WriteMs: 0
 		};
 	}
 
@@ -279,7 +285,7 @@ class MonthlyECHRScraper {
 
 	async flushNoInfoBatch() {
 		if (!this.administrativeRejectionTrackingEnabled || this.noInfoQueue.length === 0) {
-			return;
+			return { success: 0, failed: 0, administrativeRejected: [] };
 		}
 
 		const applicationNumbers = [...new Set(this.noInfoQueue)];
@@ -294,12 +300,17 @@ class MonthlyECHRScraper {
 			log(`   ⚠️  No-info tracking had ${result.failed} failed records`, true);
 		}
 
+		this.stats.noInfoSaved += result.success || 0;
+		this.stats.noInfoFailed += result.failed || 0;
+
 		if (result.administrativeRejected && result.administrativeRejected.length > 0) {
 			for (const applicationNumber of result.administrativeRejected) {
 				this.administrativelyRejectedApplicationNumbers.add(applicationNumber);
 			}
 			log(`   🚫 Marked administrative rejection after no-info grace period: ${result.administrativeRejected.length}`, true);
 		}
+
+		return result;
 	}
 
 	/**
@@ -313,11 +324,14 @@ class MonthlyECHRScraper {
 
 		log(`\n🚀 Writing batch to D1: ${this.batchQueue.length} cases, ${this.noInfoQueue.length} no-info candidates...`, true);
 		log('='.repeat(60), true);
+		const flushStartedAt = Date.now();
 
 		if (this.batchQueue.length > 0) {
 			const casesToSave = this.batchQueue;
 			const result = await this.d1.saveBatch(casesToSave);
 			log(`\n✅ Application batch complete: ${result.success} saved, ${result.failed} errors`, true);
+			this.stats.d1Saved += result.success || 0;
+			this.stats.d1Failed += result.failed || 0;
 
 			if (result.success === casesToSave.length) {
 				for (const data of casesToSave) {
@@ -333,6 +347,8 @@ class MonthlyECHRScraper {
 		// Clear the queue and reset counter
 		this.batchQueue = [];
 		this.attemptCounter = 0;
+		this.stats.flushes++;
+		this.stats.totalD1WriteMs += Date.now() - flushStartedAt;
 		log('='.repeat(60), true);
 	}
 
@@ -507,9 +523,17 @@ class MonthlyECHRScraper {
 	 * Print progress update
 	 */
 	printProgress() {
+		const metrics = this.getRuntimeMetrics();
+		const checkpoint = this.state
+			? `${this.state.currentNumber}/${this.toECHRYear(this.state.currentYear)}`
+			: 'n/a';
+
 		log(`\n ${'='.repeat(60)}`, true);
 		log('📊 PROGRESS UPDATE', true);
 		log('='.repeat(60), true);
+		log(`Elapsed: ${metrics.elapsed} | Safe time left: ${metrics.safeTimeLeft}`, true);
+		log(`Checkpoint: ${checkpoint} | Processed incl. skips: ${metrics.processed}`, true);
+		log(`Speed: ${metrics.checkedPerMinute} checked/min | ${metrics.processedPerMinute} processed/min`, true);
 		log(`Total checked: ${this.stats.totalChecked}`, true);
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
@@ -517,7 +541,9 @@ class MonthlyECHRScraper {
 		log(`🚫 Skipped administrative rejections: ${this.stats.skippedAdministrativeRejected}`, true);
 		log(`📝 No-info candidates tracked: ${this.stats.noInfoTracked}`, true);
 		log(`ℹ️  No-info known applications: ${this.stats.noInfoKnownApplication}`, true);
-		log(`⚠️  Errors: ${this.stats.errors}`, true);
+		log(`⚠️  Errors: ${this.stats.errors} (${metrics.errorRate}%)`, true);
+		log(`D1: ${this.stats.d1Saved} app saved, ${this.stats.d1Failed} app failed, ${this.stats.noInfoSaved} no-info saved, ${this.stats.noInfoFailed} no-info failed`, true);
+		log(`Flushes: ${this.stats.flushes} | Avg D1 write: ${metrics.avgD1WriteMs}ms | Queue: ${this.batchQueue.length} apps/${this.noInfoQueue.length} no-info`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
 	}
 
@@ -525,6 +551,10 @@ class MonthlyECHRScraper {
 	 * Print final statistics
 	 */
 	printFinalStats() {
+		const metrics = this.getRuntimeMetrics();
+		const checkpoint = this.state
+			? `${this.state.currentNumber}/${this.toECHRYear(this.state.currentYear)}`
+			: 'n/a';
 		const successRate = this.stats.totalChecked > 0
 			? ((this.stats.found / this.stats.totalChecked) * 100).toFixed(2)
 			: 0;
@@ -532,6 +562,9 @@ class MonthlyECHRScraper {
 		log(`\n${'='.repeat(60)}`, true);
 		log('🎉 SCRAPING COMPLETE', true);
 		log(`${'='.repeat(60)}`, true);
+		log(`Elapsed: ${metrics.elapsed} | Final checkpoint: ${checkpoint}`, true);
+		log(`Processed incl. skips: ${metrics.processed}`, true);
+		log(`Speed: ${metrics.checkedPerMinute} checked/min | ${metrics.processedPerMinute} processed/min`, true);
 		log(`Total checked: ${this.stats.totalChecked}`, true);
 		log(`✅ Found: ${this.stats.found}`, true);
 		log(`❌ Not found: ${this.stats.notFound}`, true);
@@ -539,8 +572,10 @@ class MonthlyECHRScraper {
 		log(`🚫 Skipped administrative rejections: ${this.stats.skippedAdministrativeRejected}`, true);
 		log(`📝 No-info candidates tracked: ${this.stats.noInfoTracked}`, true);
 		log(`ℹ️  No-info known applications: ${this.stats.noInfoKnownApplication}`, true);
-		log(`⚠️  Errors: ${this.stats.errors}`, true);
+		log(`⚠️  Errors: ${this.stats.errors} (${metrics.errorRate}%)`, true);
 		log(`📈 Success rate: ${successRate}%`, true);
+		log(`D1: ${this.stats.d1Saved} app saved, ${this.stats.d1Failed} app failed, ${this.stats.noInfoSaved} no-info saved, ${this.stats.noInfoFailed} no-info failed`, true);
+		log(`Flushes: ${this.stats.flushes} | Avg D1 write: ${metrics.avgD1WriteMs}ms`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
 	}
 
@@ -549,6 +584,46 @@ class MonthlyECHRScraper {
 	 */
 	sleep(ms) {
 		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	formatDuration(ms) {
+		const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+		const hours = Math.floor(totalSeconds / 3600);
+		const minutes = Math.floor((totalSeconds % 3600) / 60);
+		const seconds = totalSeconds % 60;
+
+		if (hours > 0) {
+			return `${hours}h ${minutes}m ${seconds}s`;
+		}
+
+		if (minutes > 0) {
+			return `${minutes}m ${seconds}s`;
+		}
+
+		return `${seconds}s`;
+	}
+
+	getRuntimeMetrics() {
+		const elapsedMs = Date.now() - this.startedAt;
+		const elapsedMinutes = Math.max(elapsedMs / 60000, 1 / 60);
+		const processed = this.stats.totalChecked
+			+ this.stats.skippedFinalized
+			+ this.stats.skippedAdministrativeRejected;
+		const errorRate = this.stats.totalChecked > 0
+			? (this.stats.errors / this.stats.totalChecked) * 100
+			: 0;
+
+		return {
+			elapsed: this.formatDuration(elapsedMs),
+			safeTimeLeft: this.formatDuration(this.stopNewAttemptsAt - Date.now()),
+			processed,
+			checkedPerMinute: (this.stats.totalChecked / elapsedMinutes).toFixed(2),
+			processedPerMinute: (processed / elapsedMinutes).toFixed(2),
+			errorRate: errorRate.toFixed(2),
+			avgD1WriteMs: this.stats.flushes > 0
+				? Math.round(this.stats.totalD1WriteMs / this.stats.flushes)
+				: 0
+		};
 	}
 }
 
