@@ -90,6 +90,88 @@ class D1Adapter {
         return String(str).replace(/'/g, "''");
     }
 
+    cleanTextField(value, fieldName, maxLength, required = false) {
+        if (value === undefined || value === null) {
+            if (required) {
+                throw new Error(`${fieldName} is required`);
+            }
+            return null;
+        }
+
+        const text = String(value).trim();
+        if (!text) {
+            if (required) {
+                throw new Error(`${fieldName} is required`);
+            }
+            return null;
+        }
+
+        if (text.length > maxLength) {
+            throw new Error(`${fieldName} is too long (${text.length}/${maxLength})`);
+        }
+
+        return text;
+    }
+
+    cleanDateField(value, fieldName, required = false) {
+        const text = this.cleanTextField(value, fieldName, 20, required);
+        if (!text) {
+            return null;
+        }
+
+        if (!/^(\d{1,2}\/\d{1,2}\/\d{4}|\d{4}-\d{2}-\d{2})$/.test(text)) {
+            throw new Error(`${fieldName} has invalid date format: ${text}`);
+        }
+
+        return text;
+    }
+
+    normalizeApplicationData(data) {
+        if (!data || typeof data !== 'object') {
+            throw new Error('application data must be an object');
+        }
+
+        const applicationNumber = this.cleanTextField(data.applicationNumber, 'applicationNumber', 20, true);
+        if (!/^\d+\/\d{2}$/.test(applicationNumber)) {
+            throw new Error(`applicationNumber has invalid format: ${applicationNumber}`);
+        }
+
+        const majorEventsList = Array.isArray(data.majorEventsList)
+            ? data.majorEventsList.map((event, index) => ({
+                description: this.cleanTextField(event?.description, `majorEventsList[${index}].description`, 2000, true),
+                eventDate: this.cleanDateField(event?.eventDate, `majorEventsList[${index}].eventDate`, true)
+            }))
+            : [];
+
+        return {
+            ...data,
+            applicationNumber,
+            applicationTitle: this.cleanTextField(data.applicationTitle, 'applicationTitle', 1000, true),
+            dateIntroduction: this.cleanDateField(data.dateIntroduction, 'dateIntroduction'),
+            representant: this.cleanTextField(data.representant, 'representant', 1000),
+            lastMajorEvent: this.cleanTextField(data.lastMajorEvent, 'lastMajorEvent', 2000),
+            lastMajorEventDate: this.cleanDateField(data.lastMajorEventDate, 'lastMajorEventDate'),
+            majorEventsList
+        };
+    }
+
+    validateApplications(casesData) {
+        const valid = [];
+        let failed = 0;
+
+        for (const data of casesData) {
+            try {
+                valid.push(this.normalizeApplicationData(data));
+            } catch (error) {
+                const applicationNumber = data?.applicationNumber || 'unknown';
+                failed++;
+                log(`   ⚠️  Skipping invalid case ${applicationNumber}: ${error.message}`, true);
+            }
+        }
+
+        return { valid, failed };
+    }
+
     async ensureSOPNoInfoTracking() {
         if (this.sopNoInfoTrackingReady) {
             return;
@@ -507,9 +589,10 @@ class D1Adapter {
      * Save complete application data to D1 (OPTIMIZED WITHOUT TRANSACTIONS)
      */
     async saveApplication(data) {
-        log(`\n💾 Saving to D1: ${data.applicationNumber}`);
-
         try {
+            data = this.normalizeApplicationData(data);
+            log(`\n💾 Saving to D1: ${data.applicationNumber}`);
+
             // 1. Find or create representative (if exists)
             let representativeId = null;
 
@@ -545,7 +628,7 @@ class D1Adapter {
                     '${data.applicationNumber}',
                     '${escapeSQL(data.applicationTitle)}',
                     ${country ? `'${escapeSQL(country)}'` : 'NULL'},
-                    '${dateIntroduction}',
+                    ${dateIntroduction ? `'${dateIntroduction}'` : 'NULL'},
                     ${representativeId || 'NULL'},
                     ${data.representant ? `'${escapeSQL(data.representant)}'` : 'NULL'},
                     ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
@@ -585,18 +668,19 @@ class D1Adapter {
             // 6. Delete old events + Insert all new events in ONE big query
             log(`   📋 Saving ${data.majorEventsList.length} events...`, true);
 
-            // Build multi-row INSERT for all events
-            const eventValues = data.majorEventsList.map((event, i) => {
-                const eventDate = this.convertDate(event.eventDate);
-                const isLastEvent = (i === data.majorEventsList.length - 1) ? 1 : 0;
-                return `(${applicationId}, '${eventDate}', '${escapeSQL(event.description)}', ${isLastEvent})`;
-            }).join(',\n                ');
+            let eventsSQL = `DELETE FROM events WHERE application_id = ${applicationId};`;
+            if (data.majorEventsList.length > 0) {
+                const eventValues = data.majorEventsList.map((event, i) => {
+                    const eventDate = this.convertDate(event.eventDate);
+                    const isLastEvent = (i === data.majorEventsList.length - 1) ? 1 : 0;
+                    return `(${applicationId}, '${eventDate}', '${escapeSQL(event.description)}', ${isLastEvent})`;
+                }).join(',\n                ');
 
-            const eventsSQL = `
-                DELETE FROM events WHERE application_id = ${applicationId};
-                INSERT INTO events (application_id, event_date, description, is_last_event)
-                VALUES ${eventValues}
-            `;
+                eventsSQL += `
+                    INSERT INTO events (application_id, event_date, description, is_last_event)
+                    VALUES ${eventValues}
+                `;
+            }
 
             this.executeSQL(eventsSQL);
             await this.clearSOPNoInfoCandidates([data.applicationNumber]);
@@ -619,8 +703,10 @@ class D1Adapter {
     buildBatchSQL(casesData) {
         const sqlStatements = [];
 
-        for (const data of casesData) {
+        for (const rawData of casesData) {
             try {
+                const data = this.normalizeApplicationData(rawData);
+
                 // 1. Find or create representative (still need this for ID)
                 let representativeId = null;
                 if (data.representant && data.representant.trim()) {
@@ -650,7 +736,7 @@ class D1Adapter {
                         '${data.applicationNumber}',
                         '${escapeSQL(data.applicationTitle)}',
                         ${country ? `'${escapeSQL(country)}'` : 'NULL'},
-                        '${dateIntroduction}',
+                        ${dateIntroduction ? `'${dateIntroduction}'` : 'NULL'},
                         ${representativeId || 'NULL'},
                         ${data.representant ? `'${escapeSQL(data.representant)}'` : 'NULL'},
                         ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
@@ -678,17 +764,19 @@ class D1Adapter {
                 sqlStatements.push(deleteSQL);
 
                 // 6. Build multi-row events INSERT
-                const eventValues = data.majorEventsList.map((event, i) => {
-                    const eventDate = this.convertDate(event.eventDate);
-                    const isLastEvent = (i === data.majorEventsList.length - 1) ? 1 : 0;
-                    return `((SELECT id FROM applications WHERE application_number = '${data.applicationNumber}'), '${eventDate}', '${escapeSQL(event.description)}', ${isLastEvent})`;
-                }).join(',\n                ');
+                if (data.majorEventsList.length > 0) {
+                    const eventValues = data.majorEventsList.map((event, i) => {
+                        const eventDate = this.convertDate(event.eventDate);
+                        const isLastEvent = (i === data.majorEventsList.length - 1) ? 1 : 0;
+                        return `((SELECT id FROM applications WHERE application_number = '${data.applicationNumber}'), '${eventDate}', '${escapeSQL(event.description)}', ${isLastEvent})`;
+                    }).join(',\n                ');
 
-                const eventsSQL = `INSERT INTO events (application_id, event_date, description, is_last_event) VALUES ${eventValues};`;
-                sqlStatements.push(eventsSQL);
+                    const eventsSQL = `INSERT INTO events (application_id, event_date, description, is_last_event) VALUES ${eventValues};`;
+                    sqlStatements.push(eventsSQL);
+                }
 
             } catch (error) {
-                log(`   ⚠️  Skipping case ${data.applicationNumber} in batch: ${error.message}`, true);
+                log(`   ⚠️  Skipping case ${rawData?.applicationNumber || 'unknown'} in batch: ${error.message}`, true);
             }
         }
 
@@ -703,20 +791,31 @@ class D1Adapter {
             return { success: 0, failed: 0 };
         }
 
-        log(`\n🚀 Batch saving ${casesData.length} cases...`, true);
+        const validation = this.validateApplications(casesData);
+        const validCases = validation.valid;
+
+        if (validCases.length === 0) {
+            log(`\n⚠️  Batch skipped: no valid cases (${validation.failed} invalid)`, true);
+            return { success: 0, failed: validation.failed };
+        }
+
+        log(`\n🚀 Batch saving ${validCases.length} valid cases...`, true);
+        if (validation.failed > 0) {
+            log(`   ⚠️  Invalid cases skipped before D1 write: ${validation.failed}`, true);
+        }
 
         // Use Import API (fast!)
         if (this.importAPI) {
             try {
                 // Build complete SQL with representatives included
-                const batchSQL = this.buildBatchSQLWithReps(casesData);
+                const batchSQL = this.buildBatchSQLWithReps(validCases);
 
                 // Upload via Import API - ONE CALL DOES EVERYTHING!
                 await this.importAPI.uploadSQL(batchSQL);
 
-                log(`   ✅ Batch complete: ${casesData.length} cases saved via Import API!`, true);
+                log(`   ✅ Batch complete: ${validCases.length} cases saved via Import API!`, true);
 
-                return { success: casesData.length, failed: 0 };
+                return { success: validCases.length, failed: validation.failed };
             } catch (error) {
                 log(`   ❌ Batch import failed: ${error.message}`, true);
                 log('   🔄 Falling back to individual saves...', true);
@@ -726,9 +825,9 @@ class D1Adapter {
 
         // Fallback: Save individually (slower but reliable)
         let successCount = 0;
-        let failCount = 0;
+        let failCount = validation.failed;
 
-        for (const data of casesData) {
+        for (const data of validCases) {
             const saved = await this.saveApplication(data);
             if (saved) {
                 successCount++;
@@ -744,6 +843,8 @@ class D1Adapter {
      * Build SQL for batch import INCLUDING representative handling
      */
     buildBatchSQLWithReps(casesData) {
+        casesData = this.validateApplications(casesData).valid;
+
         const sqlStatements = [];
         const escapeSQL = (str) => str ? str.replace(/'/g, "''") : null;
 
@@ -792,7 +893,7 @@ class D1Adapter {
                         '${data.applicationNumber}',
                         '${escapeSQL(data.applicationTitle)}',
                         ${country ? `'${escapeSQL(country)}'` : 'NULL'},
-                        '${dateIntroduction}',
+                        ${dateIntroduction ? `'${dateIntroduction}'` : 'NULL'},
                         ${repSubquery},
                         ${data.representant ? `'${escapeSQL(data.representant)}'` : 'NULL'},
                         ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
