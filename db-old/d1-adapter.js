@@ -1,6 +1,7 @@
 const { execSync } = require('child_process');
 const { log } = require('./debug');
 const { D1ImportAPI } = require('./d1-import-api');
+const { maskDatabaseId, verifyConfiguredD1Target } = require('./d1-target');
 
 /**
  * Adapter to save scraped data to Cloudflare D1 using Wrangler CLI
@@ -8,11 +9,9 @@ const { D1ImportAPI } = require('./d1-import-api');
 class D1Adapter {
     constructor(databaseName = 'echr-db') {
         this.databaseName = databaseName;
-        this.databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID;
-
-        if (!this.databaseId) {
-            throw new Error('CLOUDFLARE_D1_DATABASE_ID secret is required');
-        }
+        const target = verifyConfiguredD1Target(databaseName);
+        this.databaseId = target.databaseId;
+        log(`[D1] Target verified: ${databaseName} (${maskDatabaseId(this.databaseId)})`, true);
 
         // Representative cache: { name: id }
         this.repCache = new Map();

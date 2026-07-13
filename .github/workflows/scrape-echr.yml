@@ -29,6 +29,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Verify single live D1 target
+        working-directory: ./db-old
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: node d1-target.js
+
       - name: Install dependencies
         working-directory: ./db-old
         run: npm ci
