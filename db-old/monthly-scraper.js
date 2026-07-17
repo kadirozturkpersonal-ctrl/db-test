@@ -9,6 +9,7 @@ const DEFAULT_SAFE_STOP_BUFFER_MINUTES = 5;
 const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
 const DEFAULT_MAX_SCRAPE_RETRIES = 2;
 const STATE_VERSION = 1;
+const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 50;
 
 function parseNumber(value) {
 	const parsed = Number(value);
@@ -397,6 +398,7 @@ class MonthlyECHRScraper {
 						maxRetries: this.maxScrapeRetries
 					});
 					progress.errorMessage = null;
+					progress.technicalErrorCount = 0;
 					if (data) {
 						this.batchQueue.push(data);
 						progress.foundCount++;
@@ -414,6 +416,16 @@ class MonthlyECHRScraper {
 					this.stats.errors++;
 					log(`   ❌ Priority scan technical error at ${applicationNumber}: ${progress.errorMessage}`, true);
 					log('   The number is retained and the empty-result counter is unchanged.', true);
+					if (progress.technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
+						await this.flushBatch();
+						await this.currentScanQueue.saveProgress(request, progress);
+						await this.currentScanQueue.fail(
+							request,
+							new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive technical scrape errors: ${progress.errorMessage}`)
+						);
+						log(`   ❌ Priority scan #${request.id} marked failed after persistent technical errors.`, true);
+						return { handled: true, completed: false, failed: true, runtimeLimit: false };
+					}
 				}
 
 				if (this.attemptCounter >= this.BATCH_ATTEMPTS) {

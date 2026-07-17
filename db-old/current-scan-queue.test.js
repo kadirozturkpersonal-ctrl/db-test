@@ -93,6 +93,9 @@ test('technical scrape errors retain the number, empty counter, and long-cycle c
         },
         async complete() {
             throw new Error('must not complete');
+        },
+        async fail() {
+            throw new Error('must not fail after one error');
         }
     };
     const scraper = new MonthlyECHRScraper({
@@ -111,6 +114,75 @@ test('technical scrape errors retain the number, empty counter, and long-cycle c
     assert.equal(savedProgress.consecutiveEmpty, 12);
     assert.equal(savedProgress.technicalErrorCount, 3);
     assert.deepEqual(scraper.state, { currentYear: 2021, currentNumber: 777, consecutiveEmpty: 4 });
+});
+
+test('a real SOP result resets the consecutive technical error counter', async () => {
+    let savedProgress = null;
+    const currentScanQueue = {
+        async claimOrResume() {
+            return {
+                id: 10,
+                status: 'running',
+                target_year: 2026,
+                observed_max_number: 20000,
+                start_number: 19500,
+                current_number: 19510,
+                consecutive_empty: 0,
+                found_count: 5,
+                checked_count: 10,
+                technical_error_count: 49
+            };
+        },
+        async saveProgress(_request, progress) { savedProgress = { ...progress }; },
+        async complete() {},
+        async fail() { throw new Error('must not fail after a successful result'); }
+    };
+    const scraper = new MonthlyECHRScraper({
+        d1: {},
+        currentScanQueue,
+        scrapeApplication: async () => ({ applicationNumber: '19510/26' })
+    });
+    scraper.browser = {};
+    scraper.sleep = async () => {};
+    scraper.flushBatch = async () => { scraper.batchQueue = []; scraper.attemptCounter = 0; };
+    let stopChecks = 0;
+    scraper.shouldStopBeforeNextAttempt = () => stopChecks++ > 0;
+
+    await scraper.processPriorityScan('test-success-reset');
+    assert.equal(savedProgress.currentNumber, 19511);
+    assert.equal(savedProgress.technicalErrorCount, 0);
+});
+
+test('50 consecutive technical failures mark the request failed without counting an empty result', async () => {
+    let failed = false;
+    let savedProgress = null;
+    const currentScanQueue = {
+        async claimOrResume() {
+            return {
+                id: 11, status: 'running', target_year: 2026,
+                observed_max_number: 20000, start_number: 19500, current_number: 19510,
+                consecutive_empty: 7, found_count: 5, checked_count: 10,
+                technical_error_count: 49
+            };
+        },
+        async saveProgress(_request, progress) { savedProgress = { ...progress }; },
+        async complete() { throw new Error('must not complete'); },
+        async fail() { failed = true; }
+    };
+    const scraper = new MonthlyECHRScraper({
+        d1: {}, currentScanQueue,
+        scrapeApplication: async () => { throw new Error('persistent browser failure'); }
+    });
+    scraper.browser = {};
+    scraper.flushBatch = async () => { scraper.batchQueue = []; scraper.attemptCounter = 0; };
+    scraper.shouldStopBeforeNextAttempt = () => false;
+
+    const result = await scraper.processPriorityScan('test-persistent-error');
+    assert.equal(result.failed, true);
+    assert.equal(failed, true);
+    assert.equal(savedProgress.currentNumber, 19510);
+    assert.equal(savedProgress.consecutiveEmpty, 7);
+    assert.equal(savedProgress.technicalErrorCount, 50);
 });
 
 test('scraper contract keeps the long checkpoint separate and checks priority after a 250 batch', () => {
