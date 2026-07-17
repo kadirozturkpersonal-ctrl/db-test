@@ -50,6 +50,11 @@ const CONFIG = {
 
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
+const {
+	CurrentScanQueue,
+	MAX_CONSECUTIVE_EMPTY: CURRENT_SCAN_MAX_EMPTY,
+	shouldCompletePriorityScan
+} = require('./current-scan-queue');
 const { log } = require('./debug');
 
 /**
@@ -57,7 +62,9 @@ const { log } = require('./debug');
  */
 class MonthlyECHRScraper {
 	constructor(config = {}) {
-		this.d1 = new D1Adapter('echr-db');
+		this.d1 = config.d1 || new D1Adapter('echr-db');
+		this.currentScanQueue = config.currentScanQueue || new CurrentScanQueue(this.d1);
+		this.scrapeApplication = config.scrapeApplication || scrapeECHRApplication;
 		this.browser = null;
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
@@ -85,7 +92,7 @@ class MonthlyECHRScraper {
 			: Math.max(0, parseInt(config.maxScrapeRetries, 10) || 0);
 
 		// Batch configuration
-		this.BATCH_ATTEMPTS = 500; // Write after every 500 scrape attempts
+		this.BATCH_ATTEMPTS = 250; // Persist before checking the priority queue
 		this.batchQueue = []; // Cases waiting to be written
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
@@ -352,6 +359,98 @@ class MonthlyECHRScraper {
 		log('='.repeat(60), true);
 	}
 
+	async processPriorityScan(trigger) {
+		let request;
+		try {
+			request = await this.currentScanQueue.claimOrResume();
+		} catch (error) {
+			log(`   ⚠️  Priority queue check failed (${trigger}): ${error.message}`, true);
+			return { handled: false, runtimeLimit: this.shouldStopBeforeNextAttempt() };
+		}
+
+		if (!request) {
+			return { handled: false, runtimeLimit: this.shouldStopBeforeNextAttempt() };
+		}
+
+		const progress = {
+			currentNumber: request.current_number,
+			consecutiveEmpty: request.consecutive_empty,
+			foundCount: request.found_count,
+			checkedCount: request.checked_count,
+			technicalErrorCount: request.technical_error_count,
+			errorMessage: null
+		};
+		const echrYear = this.toECHRYear(request.target_year);
+		log(`\n⚡ Priority current-year scan #${request.id} (${trigger})`, true);
+		log(`   Range starts at ${request.start_number}/${echrYear}; observed max ${request.observed_max_number}/${echrYear}`, true);
+
+		try {
+			while (!this.shouldStopBeforeNextAttempt()) {
+				const currentNumber = progress.currentNumber;
+				const applicationNumber = `${currentNumber}/${echrYear}`;
+				this.attemptCounter++;
+				progress.checkedCount++;
+				this.stats.totalChecked++;
+
+				try {
+					const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
+						maxRetries: this.maxScrapeRetries
+					});
+					progress.errorMessage = null;
+					if (data) {
+						this.batchQueue.push(data);
+						progress.foundCount++;
+						progress.consecutiveEmpty = 0;
+						this.stats.found++;
+					} else {
+						progress.consecutiveEmpty++;
+						this.stats.notFound++;
+						this.queueNoInfoIfEligible(applicationNumber);
+					}
+					progress.currentNumber = currentNumber + 1;
+				} catch (error) {
+					progress.technicalErrorCount++;
+					progress.errorMessage = String(error.message || error).slice(0, 2000);
+					this.stats.errors++;
+					log(`   ❌ Priority scan technical error at ${applicationNumber}: ${progress.errorMessage}`, true);
+					log('   The number is retained and the empty-result counter is unchanged.', true);
+				}
+
+				if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
+					await this.flushBatch();
+					await this.currentScanQueue.saveProgress(request, progress);
+				}
+
+				if (shouldCompletePriorityScan(
+					progress.currentNumber,
+					request.observed_max_number,
+					progress.consecutiveEmpty,
+					CURRENT_SCAN_MAX_EMPTY
+				)) {
+					await this.flushBatch();
+					await this.currentScanQueue.saveProgress(request, progress);
+					await this.currentScanQueue.complete(request, progress);
+					log(`   ✅ Priority scan #${request.id} completed; ${progress.foundCount} records found.`, true);
+					return { handled: true, completed: true, runtimeLimit: false };
+				}
+
+				await this.sleep(250);
+			}
+
+			await this.flushBatch();
+			await this.currentScanQueue.saveProgress(request, progress);
+			log(`   ⏱️  Priority scan #${request.id} paused at ${progress.currentNumber}/${echrYear}.`, true);
+			return { handled: true, completed: false, runtimeLimit: true };
+		} catch (error) {
+			await this.flushBatch().catch(() => undefined);
+			await this.currentScanQueue.saveProgress(request, {
+				...progress,
+				errorMessage: String(error.message || error).slice(0, 2000)
+			}).catch(() => undefined);
+			throw error;
+		}
+	}
+
 	/**
 	 * Main scraping loop
 	 */
@@ -375,6 +474,10 @@ class MonthlyECHRScraper {
 		try {
 			let lastLoggedYear = null;
 			let stopReason = null;
+			const startupPriority = await this.processPriorityScan('run-start');
+			if (startupPriority.runtimeLimit) {
+				stopReason = 'runtime-limit';
+			}
 
 			while (!stopReason) {
 				if (this.shouldStopBeforeNextAttempt()) {
@@ -435,7 +538,7 @@ class MonthlyECHRScraper {
 						this.attemptCounter++;
 
 						// Scrape the case (reusing the shared browser)
-						const data = await scrapeECHRApplication(this.browser, currentNumber, echrYear, {
+						const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
 							maxRetries: this.maxScrapeRetries
 						});
 
@@ -460,6 +563,11 @@ class MonthlyECHRScraper {
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
 							await this.flushBatch();
 							this.saveState('batch-flush');
+							const priority = await this.processPriorityScan('after-saved-batch');
+							if (priority.runtimeLimit) {
+								stopReason = 'runtime-limit';
+								break;
+							}
 						} else if (this.batchQueue.length === 0) {
 							this.saveState(data ? 'found' : 'empty');
 						}
@@ -479,6 +587,11 @@ class MonthlyECHRScraper {
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
 							await this.flushBatch();
 							this.saveState('batch-flush-after-error');
+							const priority = await this.processPriorityScan('after-saved-error-batch');
+							if (priority.runtimeLimit) {
+								stopReason = 'runtime-limit';
+								break;
+							}
 						} else if (this.batchQueue.length === 0) {
 							this.saveState('error');
 						}
@@ -643,4 +756,11 @@ async function main() {
 	await scraper.run();
 }
 
-main().catch(console.error);
+if (require.main === module) {
+	main().catch(error => {
+		console.error(error);
+		process.exitCode = 1;
+	});
+}
+
+module.exports = { MonthlyECHRScraper };

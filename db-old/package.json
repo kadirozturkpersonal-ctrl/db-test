@@ -2,7 +2,7 @@
   "name": "jest-echr",
   "version": "1.0.0",
   "scripts": {
-    "test": "node --test d1-target.test.js"
+    "test": "node --test *.test.js"
   },
   "keywords": [],
   "author": "",
