@@ -3,9 +3,9 @@ name: Human Rights Daily SOP Check
 on:
   workflow_dispatch:
   schedule:
-    # The full crawler owns the shared browser and D1 writer for most of the
-    # day. Queue this focused run immediately after its overnight turn.
-    - cron: '15 5 * * *'
+    # 00:00 Istanbul is 21:00 UTC on the preceding day. This focused run has
+    # exclusive access to the shared browser and D1 writer at that time.
+    - cron: '0 21 * * *'
 
 permissions:
   contents: read
