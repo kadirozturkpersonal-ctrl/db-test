@@ -3,7 +3,8 @@ name: ECHR Scraper
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    # Türkiye saatiyle 06:00, 12:00 ve 18:00.
+    - cron: '0 3,9,15 * * *'
 
 permissions:
   contents: write
@@ -50,7 +51,9 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
           MAX_CONSECUTIVE_EMPTY: '500'
-          MAX_RUNTIME_MINUTES: '330'
+          # Altı saatlik slotlarda günlük SOP kontrolüne ve GitHub gecikmelerine
+          # güvenli pay bırakmak için ana taramayı beş saatin altında tutar.
+          MAX_RUNTIME_MINUTES: '300'
           SAFE_STOP_BUFFER_MINUTES: '5'
           SCRAPER_STATE_FILE: './scraper-state.json'
         run: node monthly-scraper.js
