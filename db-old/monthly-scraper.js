@@ -364,7 +364,7 @@ class MonthlyECHRScraper {
 
 	async processScheduledCurrentYearScan() {
 		if (!this.runCurrentYearPriorityScan) {
-			return { handled: false, runtimeLimit: false };
+			return { handled: false, stopRun: false };
 		}
 
 		const targetYear = new Date().getFullYear();
@@ -382,18 +382,59 @@ class MonthlyECHRScraper {
 		`, [`%/${echrYear}`]);
 		const observedMax = Math.max(0, Number(rows[0]?.max_number || 0));
 		const startNumber = Math.max(1, observedMax - CURRENT_YEAR_PRIORITY_OVERLAP_SIZE);
-		const progress = {
-			currentNumber: startNumber,
-			consecutiveEmpty: 0,
-			foundCount: 0,
-			technicalErrorCount: 0
-		};
-
 		log(`\n⚡ Scheduled current-year scan`, true);
-		log(`   Direct range: ${startNumber}/${echrYear} (D1 max ${observedMax}/${echrYear}); no queue record is used.`, true);
+		log(`   Forward range: ${startNumber}/${echrYear} (D1 max ${observedMax}/${echrYear}); no queue record is used.`, true);
+
+		const forward = await this.scanScheduledYearDirection({
+			year: targetYear,
+			startNumber,
+			direction: 1,
+			phase: 'current-year-forward',
+			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
+		});
+		if (forward.runtimeLimit) return { handled: true, stopRun: true };
+
+		const nextYear = targetYear + 1;
+		const nextYearCheck = await this.scanScheduledYearDirection({
+			year: nextYear,
+			startNumber: 1,
+			direction: 1,
+			phase: 'next-year-forward',
+			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
+		});
+		if (nextYearCheck.runtimeLimit) return { handled: true, stopRun: true };
+
+		const backwardStart = startNumber - 1;
+		if (backwardStart < 1) {
+			log('   ✅ Current-year reverse range is already at 1; scheduled scan complete.', true);
+			return { handled: true, completed: true, stopRun: true };
+		}
+
+		const backward = await this.scanScheduledYearDirection({
+			year: targetYear,
+			startNumber: backwardStart,
+			direction: -1,
+			phase: 'current-year-backward'
+		});
+		if (backward.runtimeLimit) return { handled: true, stopRun: true };
+
+		log('   ✅ Scheduled current-year forward, next-year, and reverse scan complete.', true);
+		return { handled: true, completed: true, stopRun: true };
+	}
+
+	async scanScheduledYearDirection({ year, startNumber, direction, phase, stopAfterConsecutiveEmpty = null }) {
+		const echrYear = this.toECHRYear(year);
+		let currentNumber = startNumber;
+		let consecutiveEmpty = 0;
+		let technicalErrorCount = 0;
+		log(`   ↳ ${phase}: ${currentNumber}/${echrYear} ${direction > 0 ? '→' : '←'}`, true);
 
 		while (!this.shouldStopBeforeNextAttempt()) {
-			const currentNumber = progress.currentNumber;
+			if (currentNumber < 1) {
+				await this.flushBatch();
+				return { completed: true, runtimeLimit: false };
+			}
+
 			const applicationNumber = `${currentNumber}/${echrYear}`;
 			this.attemptCounter++;
 			this.stats.totalChecked++;
@@ -402,26 +443,25 @@ class MonthlyECHRScraper {
 				const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
 					maxRetries: this.maxScrapeRetries
 				});
-				progress.technicalErrorCount = 0;
+				technicalErrorCount = 0;
 				if (data) {
 					this.batchQueue.push(data);
-					progress.foundCount++;
-					progress.consecutiveEmpty = 0;
+					consecutiveEmpty = 0;
 					this.stats.found++;
 				} else {
-					progress.consecutiveEmpty++;
+					consecutiveEmpty++;
 					this.stats.notFound++;
 					this.queueNoInfoIfEligible(applicationNumber);
 				}
-				progress.currentNumber = currentNumber + 1;
+				currentNumber += direction;
 			} catch (error) {
-				progress.technicalErrorCount++;
+				technicalErrorCount++;
 				this.stats.errors++;
 				const message = String(error.message || error).slice(0, 2000);
-				log(`   ❌ Scheduled current-year scan error at ${applicationNumber}: ${message}`, true);
-				if (progress.technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
+				log(`   ❌ ${phase} error at ${applicationNumber}: ${message}`, true);
+				if (technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
 					await this.flushBatch();
-					throw new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive current-year scan errors: ${message}`);
+					throw new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive ${phase} errors: ${message}`);
 				}
 			}
 
@@ -429,18 +469,18 @@ class MonthlyECHRScraper {
 				await this.flushBatch();
 			}
 
-			if (progress.currentNumber > observedMax && progress.consecutiveEmpty >= CURRENT_YEAR_PRIORITY_MAX_EMPTY) {
+			if (stopAfterConsecutiveEmpty && consecutiveEmpty >= stopAfterConsecutiveEmpty) {
 				await this.flushBatch();
-				log(`   ✅ Scheduled current-year scan completed; ${progress.foundCount} records found.`, true);
-				return { handled: true, completed: true, runtimeLimit: false };
+				log(`   ✓ ${phase}: ${stopAfterConsecutiveEmpty} consecutive empty results reached.`, true);
+				return { completed: true, runtimeLimit: false };
 			}
 
 			await this.sleep(250);
 		}
 
 		await this.flushBatch();
-		log(`   ⏱️ Scheduled current-year scan reached its runtime limit at ${progress.currentNumber}/${echrYear}.`, true);
-		return { handled: true, completed: false, runtimeLimit: true };
+		log(`   ⏱️ ${phase} reached the safe runtime limit at ${currentNumber}/${echrYear}.`, true);
+		return { completed: false, runtimeLimit: true };
 	}
 
 	/**
@@ -467,8 +507,8 @@ class MonthlyECHRScraper {
 			let lastLoggedYear = null;
 			let stopReason = null;
 			const startupPriority = await this.processScheduledCurrentYearScan();
-			if (startupPriority.runtimeLimit) {
-				stopReason = 'runtime-limit';
+			if (startupPriority.stopRun) {
+				stopReason = 'scheduled-current-year-scan';
 			}
 
 			while (!stopReason) {
