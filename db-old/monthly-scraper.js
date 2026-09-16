@@ -10,10 +10,16 @@ const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
 const DEFAULT_MAX_SCRAPE_RETRIES = 2;
 const STATE_VERSION = 1;
 const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 50;
+const CURRENT_YEAR_PRIORITY_OVERLAP_SIZE = 500;
+const CURRENT_YEAR_PRIORITY_MAX_EMPTY = 500;
 
 function parseNumber(value) {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseBoolean(value) {
+	return String(value || '').trim().toLowerCase() === 'true';
 }
 
 function readConfigFile() {
@@ -36,6 +42,7 @@ function readEnvConfig() {
 		safeStopBufferMinutes: parseNumber(process.env.SAFE_STOP_BUFFER_MINUTES),
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
+		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
 		stateFile: process.env.SCRAPER_STATE_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
@@ -51,11 +58,6 @@ const CONFIG = {
 
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
-const {
-	CurrentScanQueue,
-	MAX_CONSECUTIVE_EMPTY: CURRENT_SCAN_MAX_EMPTY,
-	shouldCompletePriorityScan
-} = require('./current-scan-queue');
 const { log } = require('./debug');
 
 /**
@@ -64,8 +66,8 @@ const { log } = require('./debug');
 class MonthlyECHRScraper {
 	constructor(config = {}) {
 		this.d1 = config.d1 || new D1Adapter('echr-db');
-		this.currentScanQueue = config.currentScanQueue || new CurrentScanQueue(this.d1);
 		this.scrapeApplication = config.scrapeApplication || scrapeECHRApplication;
+		this.runCurrentYearPriorityScan = config.runCurrentYearPriorityScan === true;
 		this.browser = null;
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
@@ -93,7 +95,7 @@ class MonthlyECHRScraper {
 			: Math.max(0, parseInt(config.maxScrapeRetries, 10) || 0);
 
 		// Batch configuration
-		this.BATCH_ATTEMPTS = 250; // Persist before checking the priority queue
+		this.BATCH_ATTEMPTS = 250;
 		this.batchQueue = []; // Cases waiting to be written
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
@@ -360,107 +362,85 @@ class MonthlyECHRScraper {
 		log('='.repeat(60), true);
 	}
 
-	async processPriorityScan(trigger) {
-		let request;
-		try {
-			request = await this.currentScanQueue.claimOrResume();
-		} catch (error) {
-			log(`   ⚠️  Priority queue check failed (${trigger}): ${error.message}`, true);
-			return { handled: false, runtimeLimit: this.shouldStopBeforeNextAttempt() };
+	async processScheduledCurrentYearScan() {
+		if (!this.runCurrentYearPriorityScan) {
+			return { handled: false, runtimeLimit: false };
 		}
 
-		if (!request) {
-			return { handled: false, runtimeLimit: this.shouldStopBeforeNextAttempt() };
-		}
-
+		const targetYear = new Date().getFullYear();
+		const echrYear = this.toECHRYear(targetYear);
+		const rows = await this.d1.querySQL(`
+			SELECT COALESCE(MAX(
+				CASE
+					WHEN INSTR(application_number, '/') > 1
+					THEN CAST(SUBSTR(application_number, 1, INSTR(application_number, '/') - 1) AS INTEGER)
+					ELSE 0
+				END
+			), 0) AS max_number
+			FROM applications
+			WHERE TRIM(application_number) LIKE ?
+		`, [`%/${echrYear}`]);
+		const observedMax = Math.max(0, Number(rows[0]?.max_number || 0));
+		const startNumber = Math.max(1, observedMax - CURRENT_YEAR_PRIORITY_OVERLAP_SIZE);
 		const progress = {
-			currentNumber: request.current_number,
-			consecutiveEmpty: request.consecutive_empty,
-			foundCount: request.found_count,
-			checkedCount: request.checked_count,
-			technicalErrorCount: request.technical_error_count,
-			errorMessage: null
+			currentNumber: startNumber,
+			consecutiveEmpty: 0,
+			foundCount: 0,
+			technicalErrorCount: 0
 		};
-		const echrYear = this.toECHRYear(request.target_year);
-		log(`\n⚡ Priority current-year scan #${request.id} (${trigger})`, true);
-		log(`   Range starts at ${request.start_number}/${echrYear}; observed max ${request.observed_max_number}/${echrYear}`, true);
 
-		try {
-			while (!this.shouldStopBeforeNextAttempt()) {
-				const currentNumber = progress.currentNumber;
-				const applicationNumber = `${currentNumber}/${echrYear}`;
-				this.attemptCounter++;
-				progress.checkedCount++;
-				this.stats.totalChecked++;
+		log(`\n⚡ Scheduled current-year scan`, true);
+		log(`   Direct range: ${startNumber}/${echrYear} (D1 max ${observedMax}/${echrYear}); no queue record is used.`, true);
 
-				try {
-					const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
-						maxRetries: this.maxScrapeRetries
-					});
-					progress.errorMessage = null;
-					progress.technicalErrorCount = 0;
-					if (data) {
-						this.batchQueue.push(data);
-						progress.foundCount++;
-						progress.consecutiveEmpty = 0;
-						this.stats.found++;
-					} else {
-						progress.consecutiveEmpty++;
-						this.stats.notFound++;
-						this.queueNoInfoIfEligible(applicationNumber);
-					}
-					progress.currentNumber = currentNumber + 1;
-				} catch (error) {
-					progress.technicalErrorCount++;
-					progress.errorMessage = String(error.message || error).slice(0, 2000);
-					this.stats.errors++;
-					log(`   ❌ Priority scan technical error at ${applicationNumber}: ${progress.errorMessage}`, true);
-					log('   The number is retained and the empty-result counter is unchanged.', true);
-					if (progress.technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
-						await this.flushBatch();
-						await this.currentScanQueue.saveProgress(request, progress);
-						await this.currentScanQueue.fail(
-							request,
-							new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive technical scrape errors: ${progress.errorMessage}`)
-						);
-						log(`   ❌ Priority scan #${request.id} marked failed after persistent technical errors.`, true);
-						return { handled: true, completed: false, failed: true, runtimeLimit: false };
-					}
+		while (!this.shouldStopBeforeNextAttempt()) {
+			const currentNumber = progress.currentNumber;
+			const applicationNumber = `${currentNumber}/${echrYear}`;
+			this.attemptCounter++;
+			this.stats.totalChecked++;
+
+			try {
+				const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
+					maxRetries: this.maxScrapeRetries
+				});
+				progress.technicalErrorCount = 0;
+				if (data) {
+					this.batchQueue.push(data);
+					progress.foundCount++;
+					progress.consecutiveEmpty = 0;
+					this.stats.found++;
+				} else {
+					progress.consecutiveEmpty++;
+					this.stats.notFound++;
+					this.queueNoInfoIfEligible(applicationNumber);
 				}
-
-				if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
+				progress.currentNumber = currentNumber + 1;
+			} catch (error) {
+				progress.technicalErrorCount++;
+				this.stats.errors++;
+				const message = String(error.message || error).slice(0, 2000);
+				log(`   ❌ Scheduled current-year scan error at ${applicationNumber}: ${message}`, true);
+				if (progress.technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
 					await this.flushBatch();
-					await this.currentScanQueue.saveProgress(request, progress);
+					throw new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive current-year scan errors: ${message}`);
 				}
-
-				if (shouldCompletePriorityScan(
-					progress.currentNumber,
-					request.observed_max_number,
-					progress.consecutiveEmpty,
-					CURRENT_SCAN_MAX_EMPTY
-				)) {
-					await this.flushBatch();
-					await this.currentScanQueue.saveProgress(request, progress);
-					await this.currentScanQueue.complete(request, progress);
-					log(`   ✅ Priority scan #${request.id} completed; ${progress.foundCount} records found.`, true);
-					return { handled: true, completed: true, runtimeLimit: false };
-				}
-
-				await this.sleep(250);
 			}
 
-			await this.flushBatch();
-			await this.currentScanQueue.saveProgress(request, progress);
-			log(`   ⏱️  Priority scan #${request.id} paused at ${progress.currentNumber}/${echrYear}.`, true);
-			return { handled: true, completed: false, runtimeLimit: true };
-		} catch (error) {
-			await this.flushBatch().catch(() => undefined);
-			await this.currentScanQueue.saveProgress(request, {
-				...progress,
-				errorMessage: String(error.message || error).slice(0, 2000)
-			}).catch(() => undefined);
-			throw error;
+			if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
+				await this.flushBatch();
+			}
+
+			if (progress.currentNumber > observedMax && progress.consecutiveEmpty >= CURRENT_YEAR_PRIORITY_MAX_EMPTY) {
+				await this.flushBatch();
+				log(`   ✅ Scheduled current-year scan completed; ${progress.foundCount} records found.`, true);
+				return { handled: true, completed: true, runtimeLimit: false };
+			}
+
+			await this.sleep(250);
 		}
+
+		await this.flushBatch();
+		log(`   ⏱️ Scheduled current-year scan reached its runtime limit at ${progress.currentNumber}/${echrYear}.`, true);
+		return { handled: true, completed: false, runtimeLimit: true };
 	}
 
 	/**
@@ -486,7 +466,7 @@ class MonthlyECHRScraper {
 		try {
 			let lastLoggedYear = null;
 			let stopReason = null;
-			const startupPriority = await this.processPriorityScan('run-start');
+			const startupPriority = await this.processScheduledCurrentYearScan();
 			if (startupPriority.runtimeLimit) {
 				stopReason = 'runtime-limit';
 			}
@@ -575,11 +555,6 @@ class MonthlyECHRScraper {
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
 							await this.flushBatch();
 							this.saveState('batch-flush');
-							const priority = await this.processPriorityScan('after-saved-batch');
-							if (priority.runtimeLimit) {
-								stopReason = 'runtime-limit';
-								break;
-							}
 						} else if (this.batchQueue.length === 0) {
 							this.saveState(data ? 'found' : 'empty');
 						}
@@ -599,11 +574,6 @@ class MonthlyECHRScraper {
 						if (this.attemptCounter >= this.BATCH_ATTEMPTS) {
 							await this.flushBatch();
 							this.saveState('batch-flush-after-error');
-							const priority = await this.processPriorityScan('after-saved-error-batch');
-							if (priority.runtimeLimit) {
-								stopReason = 'runtime-limit';
-								break;
-							}
 						} else if (this.batchQueue.length === 0) {
 							this.saveState('error');
 						}

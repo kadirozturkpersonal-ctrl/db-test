@@ -3,8 +3,11 @@ name: ECHR Scraper
 on:
   workflow_dispatch:
   schedule:
-    # Türkiye saatiyle 06:00, 12:00 ve 18:00.
-    - cron: '0 3,9,15 * * *'
+    # Türkiye saatiyle 06:00, 12:00 ve 18:00. Ayrı satırlar, yalnız 06:00
+    # çalışmasının güncel yıl öncelik taramasını doğrudan başlatmasını sağlar.
+    - cron: '0 3 * * *'
+    - cron: '0 9 * * *'
+    - cron: '0 15 * * *'
 
 permissions:
   contents: write
@@ -56,6 +59,9 @@ jobs:
           MAX_RUNTIME_MINUTES: '300'
           SAFE_STOP_BUFFER_MINUTES: '5'
           SCRAPER_STATE_FILE: './scraper-state.json'
+          # 06:00 Türkiye çalışması, kuyruk/D1 istek kaydı olmadan doğrudan
+          # 2026'nın D1'deki en yüksek numarasından 500 geriden başlar.
+          RUN_CURRENT_YEAR_PRIORITY_SCAN: ${{ github.event.schedule == '0 3 * * *' && 'true' || 'false' }}
         run: node monthly-scraper.js
 
       - name: Persist scraper checkpoint
