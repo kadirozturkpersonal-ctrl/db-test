@@ -59,10 +59,29 @@ jobs:
           MAX_RUNTIME_MINUTES: '300'
           SAFE_STOP_BUFFER_MINUTES: '5'
           SCRAPER_STATE_FILE: './scraper-state.json'
+          SCRAPER_SCHEDULE_SLOT: ${{ github.event.schedule == '0 3 * * *' && '06:00' || github.event.schedule == '0 9 * * *' && '12:00' || github.event.schedule == '0 15 * * *' && '18:00' || 'manual' }}
           # 06:00 Türkiye çalışması, kuyruk/D1 istek kaydı olmadan doğrudan
           # 2026'nın D1'deki en yüksek numarasından 500 geriden başlar.
           RUN_CURRENT_YEAR_PRIORITY_SCAN: ${{ github.event.schedule == '0 3 * * *' && 'true' || 'false' }}
         run: node monthly-scraper.js
+
+      - name: Refresh HukukiPanel AİHM published data
+        if: success()
+        env:
+          ECHR_PUBLISHED_REFRESH_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_PUBLISHED_REFRESH_URL }}
+          ECHR_PUBLISHED_REFRESH_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_PUBLISHED_REFRESH_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$ECHR_PUBLISHED_REFRESH_URL"
+          test -n "$ECHR_PUBLISHED_REFRESH_SECRET"
+          endpoint="${ECHR_PUBLISHED_REFRESH_URL%/}"
+          case "$endpoint" in
+            */api/*) endpoint="${endpoint%/api/*}/api/echr-db/refresh?wait=1" ;;
+            *) endpoint="$endpoint/api/echr-db/refresh?wait=1" ;;
+          esac
+          curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+            --header "Authorization: Bearer $ECHR_PUBLISHED_REFRESH_SECRET" \
+            --header "Content-Type: application/json" --data '{}'
 
       - name: Persist scraper checkpoint
         if: always()

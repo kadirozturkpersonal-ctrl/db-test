@@ -54,3 +54,31 @@ test('the normal 2016-to-present cycle is unchanged outside the 06:00 direct sca
     assert.match(source, /while \(!stopReason\)/);
     assert.doesNotMatch(source, /processPriorityScan/);
 });
+
+test('each scraper run records only application numbers absent before its D1 write', async () => {
+    const queries = [];
+    let lookup = 0;
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                queries.push({ sql, params });
+                if (sql.startsWith('SELECT application_number')) {
+                    lookup++;
+                    return lookup === 1 ? [{ application_number: '100/26' }] : [{ application_number: '101/26' }];
+                }
+                return [];
+            },
+            async saveBatch() { return { success: 2, failed: 0 }; },
+            async saveSOPNoInfoBatch() { return { success: 0, failed: 0 }; }
+        },
+        runId: 'run-1',
+        scheduleSlot: '06:00'
+    });
+    scraper.batchQueue = [{ applicationNumber: '100/26' }, { applicationNumber: '101/26' }];
+    await scraper.flushBatch();
+    assert.equal(scraper.newApplicationsAdded, 1);
+    await scraper.startScrapeRun();
+    await scraper.finishScrapeRun();
+    assert.match(queries.map((query) => query.sql).join('\n'), /CREATE TABLE IF NOT EXISTS echr_scraper_runs/);
+    assert.match(queries.map((query) => query.sql).join('\n'), /new_applications_added/);
+});

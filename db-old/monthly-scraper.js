@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const START_YEAR = 2016;
 const DEFAULT_MAX_CONSECUTIVE_EMPTY = 500;
@@ -43,6 +44,7 @@ function readEnvConfig() {
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
 		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
+		scheduleSlot: process.env.SCRAPER_SCHEDULE_SLOT || 'manual',
 		stateFile: process.env.SCRAPER_STATE_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
@@ -68,6 +70,10 @@ class MonthlyECHRScraper {
 		this.d1 = config.d1 || new D1Adapter('echr-db');
 		this.scrapeApplication = config.scrapeApplication || scrapeECHRApplication;
 		this.runCurrentYearPriorityScan = config.runCurrentYearPriorityScan === true;
+		this.scheduleSlot = String(config.scheduleSlot || 'manual');
+		this.runId = config.runId || crypto.randomUUID();
+		this.runStartedAt = new Date().toISOString();
+		this.newApplicationsAdded = 0;
 		this.browser = null;
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
@@ -338,10 +344,15 @@ class MonthlyECHRScraper {
 
 		if (this.batchQueue.length > 0) {
 			const casesToSave = this.batchQueue;
+			const candidateNumbers = [...new Set(casesToSave.map((data) => String(data.applicationNumber || '').trim()).filter(Boolean))];
+			const existingBefore = await this.loadExistingApplicationNumbers(candidateNumbers);
 			const result = await this.d1.saveBatch(casesToSave);
 			log(`\n✅ Application batch complete: ${result.success} saved, ${result.failed} errors`, true);
 			this.stats.d1Saved += result.success || 0;
 			this.stats.d1Failed += result.failed || 0;
+			const absentBefore = candidateNumbers.filter((number) => !existingBefore.has(number));
+			const presentAfter = await this.loadExistingApplicationNumbers(absentBefore);
+			this.newApplicationsAdded += presentAfter.size;
 
 			if (result.success === casesToSave.length) {
 				for (const data of casesToSave) {
@@ -422,6 +433,54 @@ class MonthlyECHRScraper {
 		return { handled: true, completed: true, stopRun: true };
 	}
 
+	async loadExistingApplicationNumbers(applicationNumbers) {
+		if (!applicationNumbers.length) return new Set();
+		const rows = await this.d1.querySQL(
+			`SELECT application_number FROM applications WHERE application_number IN (${applicationNumbers.map(() => '?').join(', ')})`,
+			applicationNumbers,
+		);
+		return new Set(rows.map((row) => String(row.application_number || '').trim()).filter(Boolean));
+	}
+
+	async startScrapeRun() {
+		await this.d1.querySQL(`
+			CREATE TABLE IF NOT EXISTS echr_scraper_runs (
+				id TEXT PRIMARY KEY,
+				schedule_slot TEXT NOT NULL,
+				run_mode TEXT NOT NULL,
+				status TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				new_applications_added INTEGER NOT NULL DEFAULT 0,
+				applications_saved INTEGER NOT NULL DEFAULT 0,
+				error_count INTEGER NOT NULL DEFAULT 0,
+				error_message TEXT
+			)
+		`);
+		await this.d1.querySQL(
+			`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at) VALUES (?, ?, ?, 'running', ?)`,
+			[this.runId, this.scheduleSlot, this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle', this.runStartedAt],
+		);
+	}
+
+	async finishScrapeRun(error = null) {
+		const message = error ? String(error.message || error).slice(0, 2000) : null;
+		await this.d1.querySQL(
+			`UPDATE echr_scraper_runs
+			 SET status = ?, completed_at = ?, new_applications_added = ?, applications_saved = ?, error_count = ?, error_message = ?
+			 WHERE id = ?`,
+			[
+				message ? 'failed' : 'completed',
+				new Date().toISOString(),
+				this.newApplicationsAdded,
+				this.stats.d1Saved,
+				this.stats.errors,
+				message,
+				this.runId,
+			],
+		);
+	}
+
 	async scanScheduledYearDirection({ year, startNumber, direction, phase, stopAfterConsecutiveEmpty = null }) {
 		const echrYear = this.toECHRYear(year);
 		let currentNumber = startNumber;
@@ -495,6 +554,7 @@ class MonthlyECHRScraper {
 		log(`Safe stop: no new attempts after ${new Date(this.stopNewAttemptsAt).toISOString()}`, true);
 		log(`Hard runtime target: ${new Date(this.hardStopAt).toISOString()}`, true);
 		log('='.repeat(60), true);
+		await this.startScrapeRun();
 		this.loadState();
 		this.saveState('run-start');
 		await this.loadFinalizedApplicationNumbers();
@@ -503,6 +563,7 @@ class MonthlyECHRScraper {
 		// Launch browser ONCE for the entire run
 		this.browser = await createBrowser();
 
+		let runError = null;
 		try {
 			let lastLoggedYear = null;
 			let stopReason = null;
@@ -645,12 +706,18 @@ class MonthlyECHRScraper {
 			await this.flushBatch();
 			this.saveState(stopReason || 'run-complete');
 			this.printFinalStats();
+		} catch (error) {
+			runError = error;
+			throw error;
 		} finally {
 			// Always close the browser, even if an error occurred
 			if (this.browser) {
 				log('\n🌐 Closing browser...', true);
 				await this.browser.close();
 			}
+			await this.finishScrapeRun(runError).catch((historyError) => {
+				log(`   ⚠️ Could not save scraper run history: ${historyError.message}`, true);
+			});
 		}
 	}
 
