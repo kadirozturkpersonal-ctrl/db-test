@@ -74,6 +74,8 @@ class MonthlyECHRScraper {
 		this.runId = config.runId || crypto.randomUUID();
 		this.runStartedAt = new Date().toISOString();
 		this.newApplicationsAdded = 0;
+		this.smallestScannedApplicationNumber = null;
+		this.largestScannedApplicationNumber = null;
 		this.browser = null;
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
@@ -458,6 +460,13 @@ class MonthlyECHRScraper {
 			)
 		`);
 		await this.d1.querySQL(
+			`CREATE TABLE IF NOT EXISTS echr_scraper_run_ranges (
+				run_id TEXT PRIMARY KEY,
+				smallest_application_number TEXT,
+				largest_application_number TEXT
+			)`,
+		);
+		await this.d1.querySQL(
 			`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at) VALUES (?, ?, ?, 'running', ?)`,
 			[this.runId, this.scheduleSlot, this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle', this.runStartedAt],
 		);
@@ -479,6 +488,35 @@ class MonthlyECHRScraper {
 				this.runId,
 			],
 		);
+		await this.d1.querySQL(
+			`INSERT INTO echr_scraper_run_ranges (run_id, smallest_application_number, largest_application_number)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(run_id) DO UPDATE SET
+				smallest_application_number = excluded.smallest_application_number,
+				largest_application_number = excluded.largest_application_number`,
+			[this.runId, this.smallestScannedApplicationNumber, this.largestScannedApplicationNumber],
+		);
+	}
+
+	recordScannedApplication(applicationNumber) {
+		const value = String(applicationNumber || '').trim();
+		if (!value) return;
+		if (!this.smallestScannedApplicationNumber || this.compareApplicationNumbers(value, this.smallestScannedApplicationNumber) < 0) {
+			this.smallestScannedApplicationNumber = value;
+		}
+		if (!this.largestScannedApplicationNumber || this.compareApplicationNumbers(value, this.largestScannedApplicationNumber) > 0) {
+			this.largestScannedApplicationNumber = value;
+		}
+	}
+
+	compareApplicationNumbers(left, right) {
+		const parse = (value) => {
+			const match = /^(\d+)\/(\d{2})$/.exec(String(value));
+			return match ? { number: Number(match[1]), year: 2000 + Number(match[2]) } : { number: 0, year: 0 };
+		};
+		const a = parse(left);
+		const b = parse(right);
+		return a.year - b.year || a.number - b.number;
 	}
 
 	async scanScheduledYearDirection({ year, startNumber, direction, phase, stopAfterConsecutiveEmpty = null }) {
@@ -497,6 +535,7 @@ class MonthlyECHRScraper {
 			const applicationNumber = `${currentNumber}/${echrYear}`;
 			this.attemptCounter++;
 			this.stats.totalChecked++;
+			this.recordScannedApplication(applicationNumber);
 
 			try {
 				const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
@@ -624,6 +663,7 @@ class MonthlyECHRScraper {
 					}
 
 					this.stats.totalChecked++;
+					this.recordScannedApplication(applicationNumber);
 					log(`\n[Check #${this.stats.totalChecked}] ${applicationNumber}`);
 
 					try {

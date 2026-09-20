@@ -82,3 +82,13 @@ test('each scraper run records only application numbers absent before its D1 wri
     assert.match(queries.map((query) => query.sql).join('\n'), /CREATE TABLE IF NOT EXISTS echr_scraper_runs/);
     assert.match(queries.map((query) => query.sql).join('\n'), /new_applications_added/);
 });
+
+test('scraper history preserves the smallest and largest actually attempted application numbers', async () => {
+    const scraper = new MonthlyECHRScraper({ d1: {} });
+    scraper.recordScannedApplication('300/27');
+    scraper.recordScannedApplication('20/26');
+    scraper.recordScannedApplication('999/26');
+    assert.equal(scraper.smallestScannedApplicationNumber, '20/26');
+    assert.equal(scraper.largestScannedApplicationNumber, '300/27');
+    assert.equal(scraper.compareApplicationNumbers('999/26', '1/27') < 0, true);
+});
