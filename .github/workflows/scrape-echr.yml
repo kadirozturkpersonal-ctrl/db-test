@@ -68,12 +68,17 @@ jobs:
       - name: Refresh HukukiPanel AİHM published data
         if: success()
         env:
-          ECHR_PUBLISHED_REFRESH_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_PUBLISHED_REFRESH_URL }}
-          ECHR_PUBLISHED_REFRESH_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_PUBLISHED_REFRESH_CRON_SECRET }}
+          # Günlük SOP ile aynı, doğrulanmış eski/yeni secret zincirini kullan.
+          # Önceki ECHR_PUBLISHED_REFRESH_* yedeği bu depoda tanımlı değildi;
+          # tarama başarıyla bittiği hâlde adım bu nedenle anında kırmızı oluyordu.
+          ECHR_PUBLISHED_REFRESH_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL || secrets.ECHR_PUBLISHED_REFRESH_URL }}
+          ECHR_PUBLISHED_REFRESH_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET || secrets.ECHR_PUBLISHED_REFRESH_CRON_SECRET }}
         run: |
           set -euo pipefail
-          test -n "$ECHR_PUBLISHED_REFRESH_URL"
-          test -n "$ECHR_PUBLISHED_REFRESH_SECRET"
+          if [ -z "$ECHR_PUBLISHED_REFRESH_URL" ] || [ -z "$ECHR_PUBLISHED_REFRESH_SECRET" ]; then
+            echo "::error::AİHM yayımlı veri yenilemesi için URL veya yetkilendirme secret'ı yapılandırılmamış."
+            exit 1
+          fi
           endpoint="${ECHR_PUBLISHED_REFRESH_URL%/}"
           case "$endpoint" in
             */api/*) endpoint="${endpoint%/api/*}/api/echr-db/refresh?wait=1" ;;
