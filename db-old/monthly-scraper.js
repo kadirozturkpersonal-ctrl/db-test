@@ -13,6 +13,10 @@ const STATE_VERSION = 1;
 const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 50;
 const CURRENT_YEAR_PRIORITY_OVERLAP_SIZE = 500;
 const CURRENT_YEAR_PRIORITY_MAX_EMPTY = 500;
+// Cloudflare D1's HTTP SQL endpoint has a lower bind-variable ceiling than
+// SQLite itself. Keep IN-list lookups well below that ceiling, even when a
+// scrape batch contains many found applications.
+const EXISTING_APPLICATION_LOOKUP_CHUNK_SIZE = 50;
 
 function parseNumber(value) {
 	const parsed = Number(value);
@@ -437,11 +441,20 @@ class MonthlyECHRScraper {
 
 	async loadExistingApplicationNumbers(applicationNumbers) {
 		if (!applicationNumbers.length) return new Set();
-		const rows = await this.d1.querySQL(
-			`SELECT application_number FROM applications WHERE application_number IN (${applicationNumbers.map(() => '?').join(', ')})`,
-			applicationNumbers,
-		);
-		return new Set(rows.map((row) => String(row.application_number || '').trim()).filter(Boolean));
+		const existing = new Set();
+		const distinctNumbers = [...new Set(applicationNumbers.map((number) => String(number || '').trim()).filter(Boolean))];
+		for (let offset = 0; offset < distinctNumbers.length; offset += EXISTING_APPLICATION_LOOKUP_CHUNK_SIZE) {
+			const chunk = distinctNumbers.slice(offset, offset + EXISTING_APPLICATION_LOOKUP_CHUNK_SIZE);
+			const rows = await this.d1.querySQL(
+				`SELECT application_number FROM applications WHERE application_number IN (${chunk.map(() => '?').join(', ')})`,
+				chunk,
+			);
+			for (const row of rows) {
+				const number = String(row.application_number || '').trim();
+				if (number) existing.add(number);
+			}
+		}
+		return existing;
 	}
 
 	async startScrapeRun() {

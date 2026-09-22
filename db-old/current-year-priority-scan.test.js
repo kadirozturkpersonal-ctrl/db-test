@@ -92,3 +92,20 @@ test('scraper history preserves the smallest and largest actually attempted appl
     assert.equal(scraper.largestScannedApplicationNumber, '300/27');
     assert.equal(scraper.compareApplicationNumbers('999/26', '1/27') < 0, true);
 });
+
+test('existing-number lookup stays below the Cloudflare D1 bind-variable limit', async () => {
+    const lookups = [];
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                lookups.push({ sql, params });
+                return params.slice(0, 1).map(application_number => ({ application_number }));
+            }
+        }
+    });
+    const numbers = Array.from({ length: 105 }, (_, index) => `${index + 1}/24`);
+    const existing = await scraper.loadExistingApplicationNumbers(numbers);
+    assert.deepEqual(lookups.map(lookup => lookup.params.length), [50, 50, 5]);
+    assert.equal(existing.size, 3);
+    assert.match(lookups[0].sql, /application_number IN \(\?, \?/);
+});
