@@ -1,11 +1,11 @@
 {
   "version": 1,
   "currentYear": 2024,
-  "currentNumber": 31041,
-  "consecutiveEmpty": 6,
+  "currentNumber": 38000,
+  "consecutiveEmpty": 138,
   "cycleStartYear": 2016,
   "cycleEndYear": 2027,
-  "updatedAt": "2026-09-22T12:59:15.114Z",
-  "lastReason": "scheduled-current-year-scan",
+  "updatedAt": "2026-09-22T18:46:05.660Z",
+  "lastReason": "runtime-limit",
   "maxConsecutiveEmpty": 500
 }
