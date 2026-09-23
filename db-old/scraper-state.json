@@ -5,7 +5,7 @@
   "consecutiveEmpty": 22,
   "cycleStartYear": 2016,
   "cycleEndYear": 2027,
-  "updatedAt": "2026-09-22T23:41:51.176Z",
-  "lastReason": "runtime-limit",
+  "updatedAt": "2026-09-23T13:01:28.487Z",
+  "lastReason": "scheduled-current-year-scan",
   "maxConsecutiveEmpty": 500
 }
