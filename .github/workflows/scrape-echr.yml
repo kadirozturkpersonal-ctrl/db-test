@@ -84,16 +84,10 @@ jobs:
             */api/*) endpoint="${endpoint%/api/*}/api/echr-db/refresh?wait=1" ;;
             *) endpoint="$endpoint/api/echr-db/refresh?wait=1" ;;
           esac
-          # Üretimdeki eski panel sürümü D1'i doğrudan okur; bu sürümde
-          # kayıtlı-sürüm yenileme endpointi yoktur. Böyle bir 404, tarama
-          # başarısızlığı değildir ve D1'e yazılmış verinin görünmesini
-          # engellemez. Endpoint yayımlandığında aşağıdaki POST otomatik
-          # olarak etkinleşir.
+          # Başvuru kartları D1'in yayımlanmış özet sürümünden okunur. Bu
+          # endpoint yoksa veya özet, ham `applications` sayısına ulaşmazsa
+          # tarama başarılı sayılmaz: yeni kayıtlar ekranda görünmez kalır.
           preflight_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$endpoint" || true)"
-          if [ "$preflight_status" = "404" ]; then
-            echo "::notice::Yayımlı panel Cloudflare D1'i doğrudan okuyor; kayıtlı-sürüm yenilemesi gerekmiyor."
-            exit 0
-          fi
           if [ "$preflight_status" != "200" ]; then
             echo "::error::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü."
             exit 1
