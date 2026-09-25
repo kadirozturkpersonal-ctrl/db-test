@@ -109,3 +109,22 @@ test('existing-number lookup stays below the Cloudflare D1 bind-variable limit',
     assert.equal(existing.size, 3);
     assert.match(lookups[0].sql, /application_number IN \(\?, \?/);
 });
+
+test('a stalled Playwright attempt is bounded and its browser is discarded', async () => {
+    let closeCalls = 0;
+    const scraper = new MonthlyECHRScraper({
+        d1: {},
+        scrapeAttemptTimeoutMs: 5,
+        createBrowser: async () => ({
+            close: async () => { closeCalls++; }
+        }),
+        scrapeApplication: async () => new Promise(() => {})
+    });
+
+    await assert.rejects(
+        scraper.scrapeWithDeadline(1, '26'),
+        /SOP attempt exceeded 5ms/
+    );
+    assert.equal(closeCalls, 1);
+    assert.equal(scraper.browser, null);
+});

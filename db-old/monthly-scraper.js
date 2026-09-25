@@ -9,6 +9,9 @@ const DEFAULT_MAX_RUNTIME_MINUTES = 330;
 const DEFAULT_SAFE_STOP_BUFFER_MINUTES = 5;
 const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
 const DEFAULT_MAX_SCRAPE_RETRIES = 2;
+const DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS = 45_000;
+const DEFAULT_BROWSER_MAX_UPTIME_MINUTES = 90;
+const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 const STATE_VERSION = 1;
 const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 50;
 const CURRENT_YEAR_PRIORITY_OVERLAP_SIZE = 500;
@@ -45,6 +48,8 @@ function readEnvConfig() {
 		maxRuntimeMinutes: parseNumber(process.env.MAX_RUNTIME_MINUTES),
 		maxRuntimeMs: parseNumber(process.env.MAX_RUNTIME_MS),
 		safeStopBufferMinutes: parseNumber(process.env.SAFE_STOP_BUFFER_MINUTES),
+		scrapeAttemptTimeoutMs: parseNumber(process.env.SCRAPE_ATTEMPT_TIMEOUT_MS),
+		browserMaxUptimeMinutes: parseNumber(process.env.BROWSER_MAX_UPTIME_MINUTES),
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
 		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
@@ -73,6 +78,7 @@ class MonthlyECHRScraper {
 	constructor(config = {}) {
 		this.d1 = config.d1 || new D1Adapter('echr-db');
 		this.scrapeApplication = config.scrapeApplication || scrapeECHRApplication;
+		this.createBrowser = config.createBrowser || createBrowser;
 		this.runCurrentYearPriorityScan = config.runCurrentYearPriorityScan === true;
 		this.scheduleSlot = String(config.scheduleSlot || 'manual');
 		this.runId = config.runId || crypto.randomUUID();
@@ -81,6 +87,10 @@ class MonthlyECHRScraper {
 		this.smallestScannedApplicationNumber = null;
 		this.largestScannedApplicationNumber = null;
 		this.browser = null;
+		this.browserStartedAt = null;
+		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
+		this.browserMaxUptimeMs =
+			(config.browserMaxUptimeMinutes || DEFAULT_BROWSER_MAX_UPTIME_MINUTES) * 60 * 1000;
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
 		this.maxConsecutiveEmpty =
@@ -242,6 +252,81 @@ class MonthlyECHRScraper {
 
 	shouldStopBeforeNextAttempt() {
 		return Date.now() >= this.stopNewAttemptsAt;
+	}
+
+	async closeBrowserWithinDeadline(reason) {
+		const browser = this.browser;
+		this.browser = null;
+		this.browserStartedAt = null;
+
+		if (!browser) {
+			return;
+		}
+
+		let timedOut = false;
+		await Promise.race([
+			Promise.resolve(browser.close()).catch((error) => {
+				log(`   ⚠️  Browser could not close (${reason}): ${error.message}`, true);
+			}),
+			this.sleep(BROWSER_CLOSE_TIMEOUT_MS).then(() => {
+				timedOut = true;
+			})
+		]);
+
+		if (timedOut) {
+			log(`   ⚠️  Browser close exceeded ${BROWSER_CLOSE_TIMEOUT_MS / 1000}s (${reason}); continuing safely.`, true);
+		}
+	}
+
+	async ensureHealthyBrowser() {
+		const isExpired = this.browserStartedAt &&
+			Date.now() - this.browserStartedAt >= this.browserMaxUptimeMs;
+		if (this.browser && !isExpired) {
+			return;
+		}
+
+		if (isExpired) {
+			log('   ♻️  Restarting Chromium before its safe uptime limit.', true);
+			await this.closeBrowserWithinDeadline('scheduled restart');
+		}
+
+		this.browser = await this.createBrowser();
+		this.browserStartedAt = Date.now();
+	}
+
+	async scrapeWithDeadline(applicationNumber, echrYear) {
+		await this.ensureHealthyBrowser();
+		let timedOut = false;
+		let timeoutId;
+		const scrapePromise = Promise.resolve().then(() => this.scrapeApplication(
+			this.browser,
+			applicationNumber,
+			echrYear,
+			{ maxRetries: this.maxScrapeRetries }
+		));
+
+		try {
+			return await Promise.race([
+				scrapePromise,
+				new Promise((_, reject) => {
+					timeoutId = setTimeout(() => {
+						timedOut = true;
+						const error = new Error(`SOP attempt exceeded ${this.scrapeAttemptTimeoutMs}ms`);
+						error.temporary = true;
+						reject(error);
+					}, this.scrapeAttemptTimeoutMs);
+				})
+			]);
+		} finally {
+			clearTimeout(timeoutId);
+			if (timedOut) {
+				// Closing Chromium aborts the stalled Playwright operation. Keep its late
+				// rejection handled, then create a fresh browser for the next attempt.
+				scrapePromise.catch(() => {});
+				log(`   ⚠️  ${applicationNumber}/${echrYear} exceeded its attempt budget; restarting Chromium.`, true);
+				await this.closeBrowserWithinDeadline('stalled SOP attempt');
+			}
+		}
 	}
 
 	async loadFinalizedApplicationNumbers() {
@@ -551,9 +636,7 @@ class MonthlyECHRScraper {
 			this.recordScannedApplication(applicationNumber);
 
 			try {
-				const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
-					maxRetries: this.maxScrapeRetries
-				});
+				const data = await this.scrapeWithDeadline(currentNumber, echrYear);
 				technicalErrorCount = 0;
 				if (data) {
 					this.batchQueue.push(data);
@@ -612,8 +695,9 @@ class MonthlyECHRScraper {
 		await this.loadFinalizedApplicationNumbers();
 		await this.prepareAdministrativeRejectionTracking();
 
-		// Launch browser ONCE for the entire run
-		this.browser = await createBrowser();
+		// The browser is created lazily and restarted when it becomes unhealthy or
+		// reaches its bounded uptime. A stuck Chromium close must never consume the
+		// rest of a GitHub Actions slot.
 
 		let runError = null;
 		try {
@@ -684,9 +768,7 @@ class MonthlyECHRScraper {
 						this.attemptCounter++;
 
 						// Scrape the case (reusing the shared browser)
-						const data = await this.scrapeApplication(this.browser, currentNumber, echrYear, {
-							maxRetries: this.maxScrapeRetries
-						});
+						const data = await this.scrapeWithDeadline(currentNumber, echrYear);
 
 						if (data) {
 							// Found - add to batch queue
@@ -766,7 +848,7 @@ class MonthlyECHRScraper {
 			// Always close the browser, even if an error occurred
 			if (this.browser) {
 				log('\n🌐 Closing browser...', true);
-				await this.browser.close();
+				await this.closeBrowserWithinDeadline('run cleanup');
 			}
 			await this.finishScrapeRun(runError).catch((historyError) => {
 				log(`   ⚠️ Could not save scraper run history: ${historyError.message}`, true);
