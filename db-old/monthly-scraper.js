@@ -265,7 +265,7 @@ class MonthlyECHRScraper {
 
 		let timedOut = false;
 		await Promise.race([
-			Promise.resolve(browser.close()).catch((error) => {
+			Promise.resolve().then(() => browser.close()).catch((error) => {
 				log(`   ⚠️  Browser could not close (${reason}): ${error.message}`, true);
 			}),
 			this.sleep(BROWSER_CLOSE_TIMEOUT_MS).then(() => {
