@@ -11,7 +11,7 @@
  */
 
 require('dotenv').config();
-const { scrapeECHRApplication, createBrowser } = require('./improved-scraper');
+const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
@@ -31,6 +31,7 @@ class WeeklyECHRScraper {
 			notFound: 0,
 			errors: 0
 		};
+		this.consecutiveTechnicalFailures = 0;
 	}
 
 	/**
@@ -116,6 +117,7 @@ class WeeklyECHRScraper {
 					const data = await scrapeECHRApplication(this.browser, number, year);
 
 					if (data) {
+						this.consecutiveTechnicalFailures = 0;
 						// Check if event changed
 						const newEvent = data.lastMajorEvent;
 						const hasChanged = newEvent !== caseInfo.current_event;
@@ -134,8 +136,9 @@ class WeeklyECHRScraper {
 						await this.d1.saveApplication(data);
 
 					} else {
-						// Case not found (maybe removed from ECHR website?)
-						log(`   ⚠️  Not found on ECHR website`, true);
+						this.consecutiveTechnicalFailures = 0;
+						// SOP explicitly returned no information for this valid query.
+						log(`   ⚠️  SOP returned no information`, true);
 						this.stats.notFound++;
 
 						// Mark as not found in database
@@ -145,6 +148,19 @@ class WeeklyECHRScraper {
 				} catch (error) {
 					log(`   ❌ Error: ${error.message}`, true);
 					this.stats.errors++;
+
+					// A sequence of pages that cannot produce either an SOP result or
+					// SOP's own no-information response means the source is currently
+					// unavailable to this runner. Stop before invoking the notification
+					// queue; otherwise stale data could be presented as a completed scan.
+					if (isTemporaryScrapeError(error)) {
+						this.consecutiveTechnicalFailures++;
+						if (this.consecutiveTechnicalFailures >= 5) {
+							throw new Error('SOP source is unavailable after 5 consecutive technical failures; daily notifications were not started.');
+						}
+					} else {
+						this.consecutiveTechnicalFailures = 0;
+					}
 				}
 
 				// Rate limiting - be nice to ECHR servers

@@ -7,6 +7,10 @@ rawChromium.use(StealthPlugin());
 const chromium = rawChromium;
 
 const DEFAULT_MAX_RETRIES = 2;
+// GitHub-hosted runners can need noticeably longer than a local browser before
+// SOP hydrates the result panel. A missing panel is not itself proof that the
+// application is absent from SOP.
+const SOP_RESULT_TIMEOUT_MS = 15000;
 
 class TemporaryScrapeError extends Error {
 	constructor(message, cause) {
@@ -61,19 +65,29 @@ async function scrapeECHRApplicationOnce(browser, applicationNumber, application
 			timeout: 15000
 		});
 
-		// If the SOP result panel never appears, treat it as a real no-info result.
-		const resultPanel = await page.waitForSelector('#ResultPanel', { timeout: 5000 })
+		// Wait for either a real result or SOP's explicit error panel.  Do not
+		// convert a slow/blocked page into a "not found" record: that would
+		// overwrite the health signal of every application in a daily run.
+		const waitForSopPanel = (selector, outcome) => page
+			.waitForSelector(selector, { timeout: SOP_RESULT_TIMEOUT_MS })
+			.then(() => outcome)
 			.catch(error => {
-				if (error.name === 'TimeoutError') {
-					return null;
-				}
-
+				if (error.name === 'TimeoutError') return null;
 				throw error;
 			});
 
-		if (!resultPanel) {
-			log(`   ❌ Not found`);
+		const outcome = await Promise.race([
+			waitForSopPanel('#ResultPanel', 'result'),
+			waitForSopPanel('#error-container', 'no_info')
+		]);
+
+		if (outcome === 'no_info') {
+			log(`   ⚠️  SOP returned no information`, true);
 			return null;
+		}
+
+		if (outcome !== 'result') {
+			throw new Error(`SOP result panel did not load within ${SOP_RESULT_TIMEOUT_MS / 1000} seconds`);
 		}
 
 		// Extract ALL data from the page
