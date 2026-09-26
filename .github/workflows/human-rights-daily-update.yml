@@ -3,9 +3,10 @@ name: Human Rights Daily SOP Check
 on:
   workflow_dispatch:
   schedule:
-    # 00:00 Istanbul is 21:00 UTC on the preceding day. This focused run has
-    # exclusive access to the shared browser and D1 writer at that time.
-    - cron: '0 21 * * *'
+    # 00:07 Istanbul is 21:07 UTC on the preceding day. Starting outside the
+    # top-of-hour Actions peak improves scheduler reliability; this workflow
+    # keeps exclusive access to the shared browser and D1 writer.
+    - cron: '7 21 * * *'
 
 permissions:
   contents: read
