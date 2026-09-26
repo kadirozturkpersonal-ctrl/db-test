@@ -99,6 +99,25 @@ jobs:
             --header "Authorization: Bearer $ECHR_PUBLISHED_REFRESH_SECRET" \
             --header "Content-Type: application/json" --data '{}'
 
+      - name: Notify portfolio stage changes
+        if: success()
+        env:
+          PORTFOLIO_NOTIFICATION_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
+          PORTFOLIO_NOTIFICATION_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$PORTFOLIO_NOTIFICATION_URL"
+          test -n "$PORTFOLIO_NOTIFICATION_SECRET"
+          endpoint="${PORTFOLIO_NOTIFICATION_URL%/}"
+          case "$endpoint" in
+            */api/*) endpoint="${endpoint%/api/*}/api/echr-db/portfolio-stage-notifications" ;;
+            *) endpoint="$endpoint/api/echr-db/portfolio-stage-notifications" ;;
+          esac
+          curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+            --header "Authorization: Bearer $PORTFOLIO_NOTIFICATION_SECRET" \
+            --header "Content-Type: application/json" \
+            --data @db-old/portfolio-stage-changes.json
+
       - name: Persist scraper checkpoint
         if: always()
         run: |

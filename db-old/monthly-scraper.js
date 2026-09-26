@@ -107,6 +107,7 @@ class MonthlyECHRScraper {
 		this.hardStopAt = this.startedAt + this.maxRuntimeMs;
 		this.state = null;
 		this.finalizedApplicationNumbers = new Set();
+		this.portfolioStageChanges = [];
 		this.knownApplicationNumbers = new Set();
 		this.administrativelyRejectedApplicationNumbers = new Set();
 		this.administrativeRejectionTrackingEnabled = false;
@@ -437,6 +438,7 @@ class MonthlyECHRScraper {
 			const casesToSave = this.batchQueue;
 			const candidateNumbers = [...new Set(casesToSave.map((data) => String(data.applicationNumber || '').trim()).filter(Boolean))];
 			const existingBefore = await this.loadExistingApplicationNumbers(candidateNumbers);
+			const stagesBefore = await this.loadExistingStageDetails(candidateNumbers);
 			const result = await this.d1.saveBatch(casesToSave);
 			log(`\n✅ Application batch complete: ${result.success} saved, ${result.failed} errors`, true);
 			this.stats.d1Saved += result.success || 0;
@@ -444,6 +446,18 @@ class MonthlyECHRScraper {
 			const absentBefore = candidateNumbers.filter((number) => !existingBefore.has(number));
 			const presentAfter = await this.loadExistingApplicationNumbers(absentBefore);
 			this.newApplicationsAdded += presentAfter.size;
+			for (const data of casesToSave) {
+				const previous = stagesBefore.get(String(data.applicationNumber || '').trim());
+				if (!previous || this.isSameStage(previous, data)) continue;
+				this.portfolioStageChanges.push({
+					applicationNumber: String(data.applicationNumber || '').trim(),
+					applicationTitle: String(data.applicationTitle || '').trim(),
+					previousEvent: previous.last_major_event || '',
+					previousEventDate: previous.last_major_event_date || '',
+					currentEvent: String(data.lastMajorEvent || '').trim(),
+					currentEventDate: String(data.lastMajorEventDate || '').trim()
+				});
+			}
 
 			if (result.success === casesToSave.length) {
 				for (const data of casesToSave) {
@@ -540,6 +554,34 @@ class MonthlyECHRScraper {
 			}
 		}
 		return existing;
+	}
+
+	async loadExistingStageDetails(applicationNumbers) {
+		const result = new Map();
+		const distinctNumbers = [...new Set(applicationNumbers.map((number) => String(number || '').trim()).filter(Boolean))];
+		for (let offset = 0; offset < distinctNumbers.length; offset += EXISTING_APPLICATION_LOOKUP_CHUNK_SIZE) {
+			const chunk = distinctNumbers.slice(offset, offset + EXISTING_APPLICATION_LOOKUP_CHUNK_SIZE);
+			const rows = await this.d1.querySQL(
+				`SELECT application_number, last_major_event, last_major_event_date FROM applications WHERE application_number IN (${chunk.map(() => '?').join(', ')})`,
+				chunk,
+			);
+			for (const row of rows) result.set(String(row.application_number || '').trim(), row);
+		}
+		return result;
+	}
+
+	isSameStage(previous, current) {
+		return String(previous.last_major_event || '').trim() === String(current.lastMajorEvent || '').trim()
+			&& String(previous.last_major_event_date || '').trim() === String(current.lastMajorEventDate || '').trim();
+	}
+
+	persistPortfolioStageChanges() {
+		const outputPath = process.env.PORTFOLIO_STAGE_CHANGES_FILE || path.resolve(__dirname, 'portfolio-stage-changes.json');
+		const unique = Array.from(new Map(this.portfolioStageChanges
+			.filter((item) => item.applicationNumber && item.currentEvent)
+			.map((item) => [item.applicationNumber, item])).values());
+		fs.writeFileSync(outputPath, `${JSON.stringify({ runId: this.runId, scheduleSlot: this.scheduleSlot, changes: unique }, null, 2)}\n`);
+		log(`   📬 Portfolio stage changes saved: ${unique.length}`, true);
 	}
 
 	async startScrapeRun() {
@@ -853,6 +895,7 @@ class MonthlyECHRScraper {
 			await this.finishScrapeRun(runError).catch((historyError) => {
 				log(`   ⚠️ Could not save scraper run history: ${historyError.message}`, true);
 			});
+			this.persistPortfolioStageChanges();
 		}
 	}
 
