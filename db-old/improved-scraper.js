@@ -54,11 +54,15 @@ async function scrapeECHRApplicationOnce(browser, applicationNumber, application
 
 	log(`🔍 Checking: ${applicationNumber}/${applicationYear}`, true);
 
-	// Fresh context per case (isolates cookies/storage between cases)
-	const context = await browser.newContext();
-	const page = await context.newPage();
+	// Fresh context per case (isolates cookies/storage between cases).
+	// Chromium may be restarted by the outer deadline while this setup is in
+	// flight, so setup errors must follow the same retry path as page errors.
+	let context;
 
 	try {
+		context = await browser.newContext();
+		const page = await context.newPage();
+
 		// Navigate to the URL
 		await page.goto(url, {
 			waitUntil: 'domcontentloaded',
@@ -158,7 +162,7 @@ async function scrapeECHRApplicationOnce(browser, applicationNumber, application
 		throw new TemporaryScrapeError(error.message, error);
 	} finally {
 		// Only close the context (cheap), NOT the browser
-		await context.close().catch(error => {
+		await context?.close().catch(error => {
 			log(`   ⚠️  Could not close browser context: ${error.message}`, true);
 		});
 	}

@@ -67,7 +67,12 @@ const CONFIG = {
 // DO NOT EDIT BELOW THIS LINE
 // ============================================================
 
-const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
+const {
+	scrapeECHRApplication,
+	createBrowser,
+	isTemporaryScrapeError,
+	TemporaryScrapeError
+} = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
@@ -296,7 +301,11 @@ class MonthlyECHRScraper {
 	}
 
 	async scrapeWithDeadline(applicationNumber, echrYear) {
-		await this.ensureHealthyBrowser();
+		try {
+			await this.ensureHealthyBrowser();
+		} catch (error) {
+			throw new TemporaryScrapeError(`Could not launch Chromium: ${error.message}`, error);
+		}
 		let timedOut = false;
 		let timeoutId;
 		const scrapePromise = Promise.resolve().then(() => this.scrapeApplication(
@@ -509,6 +518,7 @@ class MonthlyECHRScraper {
 			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
 		});
 		if (forward.runtimeLimit) return { handled: true, stopRun: true };
+		if (forward.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		const nextYear = targetYear + 1;
 		const nextYearCheck = await this.scanScheduledYearDirection({
@@ -519,6 +529,7 @@ class MonthlyECHRScraper {
 			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
 		});
 		if (nextYearCheck.runtimeLimit) return { handled: true, stopRun: true };
+		if (nextYearCheck.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		const backwardStart = startNumber - 1;
 		if (backwardStart < 1) {
@@ -533,6 +544,7 @@ class MonthlyECHRScraper {
 			phase: 'current-year-backward'
 		});
 		if (backward.runtimeLimit) return { handled: true, stopRun: true };
+		if (backward.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		log('   ✅ Scheduled current-year forward, next-year, and reverse scan complete.', true);
 		return { handled: true, completed: true, stopRun: true };
@@ -697,7 +709,8 @@ class MonthlyECHRScraper {
 				log(`   ❌ ${phase} error at ${applicationNumber}: ${message}`, true);
 				if (technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
 					await this.flushBatch();
-					throw new Error(`${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive ${phase} errors: ${message}`);
+					log(`   ⚠️  ${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive ${phase} technical errors; deferring this scan to the next scheduled run.`, true);
+					return { completed: false, runtimeLimit: false, deferred: true };
 				}
 			}
 
@@ -885,6 +898,16 @@ class MonthlyECHRScraper {
 			this.printFinalStats();
 		} catch (error) {
 			runError = error;
+			try {
+				await this.flushBatch();
+			} catch (flushError) {
+				log(`   ⚠️  Could not flush after fatal error: ${flushError.message}`, true);
+			}
+			try {
+				this.saveState('fatal-error');
+			} catch (stateError) {
+				log(`   ⚠️  Could not save checkpoint after fatal error: ${stateError.message}`, true);
+			}
 			throw error;
 		} finally {
 			// Always close the browser, even if an error occurred
@@ -1007,7 +1030,7 @@ class MonthlyECHRScraper {
 	}
 }
 
-async function main() {
+async function main(onScraperCreated) {
 	const cycleEndYear = new Date().getFullYear() + 1;
 	log('\n📋 Configuration:', true);
 	log(`   Year cycle: ${START_YEAR} to ${cycleEndYear}, then ${START_YEAR}`, true);
@@ -1020,11 +1043,38 @@ async function main() {
 	await new Promise(resolve => setTimeout(resolve, 5000));
 
 	const scraper = new MonthlyECHRScraper(CONFIG);
+	if (onScraperCreated) onScraperCreated(scraper);
 	await scraper.run();
 }
 
+function writeFailureReport(error, scraper) {
+	const reportPath = path.resolve(
+		__dirname,
+		process.env.SCRAPER_FAILURE_REPORT_FILE || 'scraper-failure.json'
+	);
+	const report = {
+		failedAt: new Date().toISOString(),
+		message: String(error?.message || error),
+		stack: error?.stack || null,
+		runId: scraper?.runId || null,
+		checkpoint: scraper?.state || null,
+		stats: scraper?.stats || null
+	};
+
+	try {
+		fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+		console.error(`Scraper failure report saved: ${reportPath}`);
+	} catch (reportError) {
+		console.error(`Could not save scraper failure report: ${reportError.message}`);
+	}
+}
+
 if (require.main === module) {
-	main().catch(error => {
+	let scraper;
+	main((createdScraper) => {
+		scraper = createdScraper;
+	}).catch(error => {
+		writeFailureReport(error, scraper);
 		console.error(error);
 		process.exitCode = 1;
 	});

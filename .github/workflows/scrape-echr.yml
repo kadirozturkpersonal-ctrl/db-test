@@ -62,6 +62,7 @@ jobs:
           SCRAPE_ATTEMPT_TIMEOUT_MS: '45000'
           BROWSER_MAX_UPTIME_MINUTES: '90'
           SCRAPER_STATE_FILE: './scraper-state.json'
+          SCRAPER_FAILURE_REPORT_FILE: './scraper-failure.json'
           SCRAPER_SCHEDULE_SLOT: ${{ github.event.schedule == '0 3 * * *' && '06:00' || github.event.schedule == '0 9 * * *' && '12:00' || github.event.schedule == '0 15 * * *' && '18:00' || 'manual' }}
           # 06:00 Türkiye çalışması, kuyruk/D1 istek kaydı olmadan doğrudan
           # 2026'nın D1'deki en yüksek numarasından 500 geriden başlar.
@@ -90,14 +91,25 @@ jobs:
           # Başvuru kartları D1'in yayımlanmış özet sürümünden okunur. Bu
           # endpoint yoksa veya özet, ham `applications` sayısına ulaşmazsa
           # tarama başarılı sayılmaz: yeni kayıtlar ekranda görünmez kalır.
-          preflight_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$endpoint" || true)"
+          preflight_status="$(curl --silent --show-error --retry 3 --retry-all-errors --connect-timeout 15 --max-time 30 --output /dev/null --write-out '%{http_code}' "$endpoint" || true)"
           if [ "$preflight_status" != "200" ]; then
             echo "::error::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü."
             exit 1
           fi
-          curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+          response_file="$(mktemp)"
+          set +e
+          response_status="$(curl --silent --show-error --request POST "$endpoint" \
             --header "Authorization: Bearer $ECHR_PUBLISHED_REFRESH_SECRET" \
-            --header "Content-Type: application/json" --data '{}'
+            --header "Content-Type: application/json" --data '{}' \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
+            --output "$response_file" --write-out '%{http_code}')"
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
+            echo "::error::AİHM yayımlı veri yenilemesi HTTP $response_status ile başarısız oldu."
+            head -c 2000 "$response_file" || true
+            exit 1
+          fi
 
       - name: Notify portfolio stage changes
         if: success()
@@ -113,10 +125,21 @@ jobs:
             */api/*) endpoint="${endpoint%/api/*}/api/echr-db/portfolio-stage-notifications" ;;
             *) endpoint="$endpoint/api/echr-db/portfolio-stage-notifications" ;;
           esac
-          curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+          response_file="$(mktemp)"
+          set +e
+          response_status="$(curl --silent --show-error --request POST "$endpoint" \
             --header "Authorization: Bearer $PORTFOLIO_NOTIFICATION_SECRET" \
             --header "Content-Type: application/json" \
-            --data @db-old/portfolio-stage-changes.json
+            --data @db-old/portfolio-stage-changes.json \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+            --output "$response_file" --write-out '%{http_code}')"
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
+            echo "::error::Portföy aşama bildirimi HTTP $response_status ile başarısız oldu."
+            head -c 2000 "$response_file" || true
+            exit 1
+          fi
 
       - name: Persist scraper checkpoint
         if: always()
@@ -132,9 +155,11 @@ jobs:
             echo "No checkpoint changes to persist."
           fi
 
-      - name: Upload logs (if job fails)
+      - name: Upload scraper failure report
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-logs
-          path: db-old/*.log
+          name: scraper-failure-report
+          path: db-old/scraper-failure.json
+          if-no-files-found: ignore
+          retention-days: 14

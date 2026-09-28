@@ -128,3 +128,36 @@ test('a stalled Playwright attempt is bounded and its browser is discarded', asy
     assert.equal(closeCalls, 1);
     assert.equal(scraper.browser, null);
 });
+
+test('a Chromium launch failure is treated as temporary and does not become an empty SOP result', async () => {
+    const scraper = new MonthlyECHRScraper({
+        d1: {},
+        createBrowser: async () => { throw new Error('browser unavailable'); }
+    });
+
+    await assert.rejects(
+        scraper.scrapeWithDeadline(1, '26'),
+        error => error.temporary === true && /Could not launch Chromium/.test(error.message)
+    );
+});
+
+test('a scheduled priority scan defers after sustained technical errors instead of failing the workflow', async () => {
+    const scraper = new MonthlyECHRScraper({ d1: {} });
+    scraper.scrapeWithDeadline = async () => {
+        const error = new Error('SOP unavailable');
+        error.temporary = true;
+        throw error;
+    };
+    scraper.sleep = async () => {};
+
+    const result = await scraper.scanScheduledYearDirection({
+        year: 2026,
+        startNumber: 1,
+        direction: 1,
+        phase: 'current-year-forward'
+    });
+
+    assert.deepEqual(result, { completed: false, runtimeLimit: false, deferred: true });
+    assert.equal(scraper.stats.errors, 50);
+    assert.equal(scraper.stats.notFound, 0);
+});
