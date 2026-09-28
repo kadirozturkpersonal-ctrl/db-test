@@ -40,6 +40,7 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Safely scan active Human Rights subscriptions
+        id: daily_sop_check
         working-directory: ./db-old
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -49,6 +50,7 @@ jobs:
         run: node weekly-scraper.js
 
       - name: Apply verified D1 stages and issue notifications
+        if: success() && steps.daily_sop_check.outputs.source_available == 'true'
         env:
           HUMAN_RIGHTS_DAILY_UPDATE_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
           HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}

@@ -11,17 +11,21 @@
  */
 
 require('dotenv').config();
+const fs = require('fs');
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
 
 class WeeklyECHRScraper {
-	constructor(databaseName = 'echr-db') {
+	constructor(databaseName = 'echr-db', dependencies = {}) {
 		// NOTE: Weekly scraper uses Wrangler CLI (executeSQL), not Import API
 		// Import API is only used in monthly scraper for batch operations
-		this.d1 = new D1Adapter(databaseName);
+		this.d1 = dependencies.d1 || new D1Adapter(databaseName);
+		this.createBrowser = dependencies.createBrowser || createBrowser;
+		this.scrapeApplication = dependencies.scrapeApplication || scrapeECHRApplication;
 		this.databaseName = databaseName;
 		this.browser = null;
+		this.sourceUnavailable = false;
 
 		// Stats
 		this.stats = {
@@ -98,7 +102,7 @@ class WeeklyECHRScraper {
 		log('-'.repeat(60), true);
 
 		// Launch browser ONCE for the entire run
-		this.browser = await createBrowser();
+		this.browser = await this.createBrowser();
 
 		try {
 			// Process each case
@@ -114,7 +118,7 @@ class WeeklyECHRScraper {
 					const [number, year] = caseInfo.application_number.split('/');
 
 					// Scrape the case (reusing the shared browser)
-					const data = await scrapeECHRApplication(this.browser, number, year);
+					const data = await this.scrapeApplication(this.browser, number, year);
 
 					if (data) {
 						this.consecutiveTechnicalFailures = 0;
@@ -156,7 +160,9 @@ class WeeklyECHRScraper {
 					if (isTemporaryScrapeError(error)) {
 						this.consecutiveTechnicalFailures++;
 						if (this.consecutiveTechnicalFailures >= 5) {
-							throw new Error('SOP source is unavailable after 5 consecutive technical failures; daily notifications were not started.');
+							this.sourceUnavailable = true;
+							log('   ⚠️  SOP source is unavailable after 5 consecutive technical failures; deferring the subscription scan to the next scheduled run.', true);
+							break;
 						}
 					} else {
 						this.consecutiveTechnicalFailures = 0;
@@ -168,13 +174,21 @@ class WeeklyECHRScraper {
 				await this.sleep(300);
 			}
 
+			if (this.sourceUnavailable) {
+				log('\n⏱️  Subscription scan deferred. No records or notifications were changed.', true);
+			}
+
 			// Print final stats
 			this.printStats();
+			this.writeWorkflowOutcome();
+			return { sourceAvailable: !this.sourceUnavailable };
 		} finally {
 			// Always close the browser, even if an error occurred
 			if (this.browser) {
 				log('\n🌐 Closing browser...', true);
-				await this.browser.close();
+				await this.browser.close().catch(error => {
+					log(`   ⚠️  Could not close browser: ${error.message}`, true);
+				});
 			}
 		}
 	}
@@ -192,6 +206,14 @@ class WeeklyECHRScraper {
 		log(`⚠️  Not found: ${this.stats.notFound}`, true);
 		log(`❌ Errors: ${this.stats.errors}`, true);
 		log(`${'='.repeat(60)}\n`, true);
+	}
+
+	writeWorkflowOutcome() {
+		if (!process.env.GITHUB_OUTPUT) return;
+		fs.appendFileSync(
+			process.env.GITHUB_OUTPUT,
+			`source_available=${this.sourceUnavailable ? 'false' : 'true'}\n`
+		);
 	}
 
 	/**
