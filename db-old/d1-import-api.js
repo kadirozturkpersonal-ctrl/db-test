@@ -17,6 +17,33 @@ class D1ImportAPI {
 		};
 	}
 
+	async fetchWithRetry(url, options, label, maxAttempts = 3) {
+		let lastError;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 60_000);
+			try {
+				const response = await fetch(url, { ...options, signal: controller.signal });
+				if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === maxAttempts) {
+					return response;
+				}
+				lastError = new Error(`${label} HTTP ${response.status}`);
+			} catch (error) {
+				lastError = error;
+				if (attempt === maxAttempts) throw error;
+			} finally {
+				clearTimeout(timeout);
+			}
+
+			const delayMs = attempt * 1000;
+			log(`   ⚠️  ${label} temporarily failed (${lastError.message}); retrying in ${delayMs}ms.`, true);
+			await new Promise(resolve => setTimeout(resolve, delayMs));
+		}
+
+		throw lastError;
+	}
+
 	/**
 	 * Poll import status until complete
 	 */
@@ -27,7 +54,7 @@ class D1ImportAPI {
 		};
 
 		while (true) {
-			const pollResponse = await fetch(this.apiUrl, {
+			const pollResponse = await this.fetchWithRetry(this.apiUrl, {
 				method: 'POST',
 				headers: this.headers,
 				body: JSON.stringify(payload),
@@ -56,7 +83,7 @@ class D1ImportAPI {
 			log('   📤 Initiating D1 import...', true);
 
 			// 2. Init upload
-			const initResponse = await fetch(this.apiUrl, {
+			const initResponse = await this.fetchWithRetry(this.apiUrl, {
 				method: 'POST',
 				headers: this.headers,
 				body: JSON.stringify({
@@ -86,12 +113,15 @@ class D1ImportAPI {
 			log('   ☁️  Uploading to R2...', true);
 
 			// 3. Upload to R2
-			const r2Response = await fetch(uploadUrl, {
+			const r2Response = await this.fetchWithRetry(uploadUrl, {
 				method: 'PUT',
 				body: sqlStatement,
 			});
 
-			const r2Etag = r2Response.headers.get('ETag').replace(/"/g, '');
+			if (!r2Response.ok) {
+				throw new Error(`R2 upload HTTP ${r2Response.status}`);
+			}
+			const r2Etag = r2Response.headers.get('ETag')?.replace(/"/g, '');
 
 			// Verify etag
 			if (r2Etag !== hashStr) {
@@ -101,7 +131,7 @@ class D1ImportAPI {
 			log('   💾 Starting ingestion...', true);
 
 			// 4. Start ingestion
-			const ingestResponse = await fetch(this.apiUrl, {
+			const ingestResponse = await this.fetchWithRetry(this.apiUrl, {
 				method: 'POST',
 				headers: this.headers,
 				body: JSON.stringify({

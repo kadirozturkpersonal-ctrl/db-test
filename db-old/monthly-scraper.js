@@ -13,7 +13,9 @@ const DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS = 45_000;
 const DEFAULT_BROWSER_MAX_UPTIME_MINUTES = 90;
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 const STATE_VERSION = 1;
-const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 50;
+// A missing SOP panel is a source/connection health signal, not an absent
+// application. Stop early and retry the same number in the next slot.
+const CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS = 5;
 const CURRENT_YEAR_PRIORITY_OVERLAP_SIZE = 500;
 const CURRENT_YEAR_PRIORITY_MAX_EMPTY = 500;
 // Cloudflare D1's HTTP SQL endpoint has a lower bind-variable ceiling than
@@ -123,7 +125,7 @@ class MonthlyECHRScraper {
 			: Math.max(0, parseInt(config.maxScrapeRetries, 10) || 0);
 
 		// Batch configuration
-		this.BATCH_ATTEMPTS = 250;
+		this.BATCH_ATTEMPTS = 500;
 		this.batchQueue = []; // Cases waiting to be written
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
@@ -853,11 +855,17 @@ class MonthlyECHRScraper {
 					} catch (error) {
 						log(`   ❌ Error: ${error.message}`, true);
 						this.stats.errors++;
-						this.state.currentNumber = currentNumber + 1;
 
 						if (isTemporaryScrapeError(error)) {
-							log('   ℹ️  Temporary scrape error exhausted retries; not counted as empty SOP result.', true);
+							// Do not advance the checkpoint. This request was not answered by SOP,
+							// so advancing would silently postpone it until the next full cycle.
+							await this.flushBatch();
+							this.saveState('temporary-source-error');
+							log('   ⏱️  Temporary SOP error exhausted retries; checkpoint retained and run deferred to the next scheduled slot.', true);
+							stopReason = 'temporary-source-error';
+							break;
 						} else {
+							this.state.currentNumber = currentNumber + 1;
 							this.state.consecutiveEmpty++;
 						}
 
@@ -871,6 +879,7 @@ class MonthlyECHRScraper {
 					}
 
 					// Rate limiting
+					if (stopReason) break;
 					await this.sleep(250);
 
 					// Progress update every 25 cases
@@ -891,6 +900,8 @@ class MonthlyECHRScraper {
 
 			if (stopReason === 'runtime-limit') {
 				log('\n⏱️  Safe runtime limit reached. Flushing and saving checkpoint...', true);
+			} else if (stopReason === 'temporary-source-error') {
+				log('\n⏱️  SOP is temporarily unavailable. State is preserved for the next scheduled run.', true);
 			}
 
 			await this.flushBatch();

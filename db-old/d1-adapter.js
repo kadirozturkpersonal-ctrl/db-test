@@ -33,6 +33,35 @@ class D1Adapter {
         }
     }
 
+    async fetchWithRetry(url, options, label, maxAttempts = 3) {
+        let lastError;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 30_000);
+            try {
+                const response = await fetch(url, { ...options, signal: controller.signal });
+                // Authentication and SQL validation failures are permanent. Only retry
+                // transient service pressure and upstream gateway failures.
+                if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === maxAttempts) {
+                    return response;
+                }
+                lastError = new Error(`${label} HTTP ${response.status}`);
+            } catch (error) {
+                lastError = error;
+                if (attempt === maxAttempts) throw error;
+            } finally {
+                clearTimeout(timeout);
+            }
+
+            const delayMs = attempt * 1000;
+            log(`   ⚠️  ${label} temporarily failed (${lastError.message}); retrying in ${delayMs}ms.`, true);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+
+        throw lastError;
+    }
+
     /**
      * Query D1 through the REST API when credentials are available.
      */
@@ -55,7 +84,7 @@ class D1Adapter {
             return rows;
         }
 
-        const response = await fetch(
+        const response = await this.fetchWithRetry(
             `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/d1/database/${encodeURIComponent(this.databaseId)}/query`,
             {
                 method: 'POST',

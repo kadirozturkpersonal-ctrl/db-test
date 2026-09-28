@@ -81,8 +81,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$ECHR_PUBLISHED_REFRESH_URL" ] || [ -z "$ECHR_PUBLISHED_REFRESH_SECRET" ]; then
-            echo "::error::AİHM yayımlı veri yenilemesi için URL veya yetkilendirme secret'ı yapılandırılmamış."
-            exit 1
+            echo "::warning::AİHM yayımlı veri yenilemesi için URL veya yetkilendirme secret'ı yapılandırılmamış. D1 tarama verisi kaydedildi; panel yenilemesi atlandı."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           endpoint="${ECHR_PUBLISHED_REFRESH_URL%/}"
           case "$endpoint" in
@@ -99,8 +100,9 @@ jobs:
             exit 0
           fi
           if [ "$preflight_status" != "200" ]; then
-            echo "::error::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü."
-            exit 1
+            echo "::warning::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü. D1 tarama verisi kaydedildi; panel yenilemesi sonraki run'da yeniden denenecek."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           response_file="$(mktemp)"
           set +e
@@ -112,9 +114,10 @@ jobs:
           curl_exit=$?
           set -e
           if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
-            echo "::error::AİHM yayımlı veri yenilemesi HTTP $response_status ile başarısız oldu."
+            echo "::warning::AİHM yayımlı veri yenilemesi HTTP $response_status ile başarısız oldu. D1 tarama verisi kaydedildi; panel yenilemesi sonraki run'da yeniden denenecek."
             head -c 2000 "$response_file" || true
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "available=true" >> "$GITHUB_OUTPUT"
 
@@ -143,21 +146,32 @@ jobs:
           curl_exit=$?
           set -e
           if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
-            echo "::error::Portföy aşama bildirimi HTTP $response_status ile başarısız oldu."
+            echo "::warning::Portföy aşama bildirimi HTTP $response_status ile başarısız oldu. Tarama verisi D1'de korundu; bildirim sonraki run'da yeniden denenecek."
             head -c 2000 "$response_file" || true
-            exit 1
+            exit 0
           fi
 
       - name: Persist scraper checkpoint
         if: always()
         run: |
+          set -u
           if [ -n "$(git status --porcelain -- db-old/scraper-state.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add db-old/scraper-state.json
-            git commit -m "chore: update ECHR scraper checkpoint [skip ci]"
-            git pull --rebase origin "$GITHUB_REF_NAME"
-            git push origin "HEAD:$GITHUB_REF_NAME"
+            if ! git commit -m "chore: update ECHR scraper checkpoint [skip ci]"; then
+              echo "::warning::Checkpoint commit could not be created. D1 writes are already durable; the next run may repeat a small range safely."
+              exit 0
+            fi
+            for attempt in 1 2 3; do
+              if git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME"; then
+                exit 0
+              fi
+              echo "::warning::Checkpoint push attempt $attempt failed; retrying shortly."
+              sleep $((attempt * 5))
+            done
+            echo "::warning::Checkpoint could not be pushed. D1 writes are already durable; the next run may repeat a small range safely."
+            exit 0
           else
             echo "No checkpoint changes to persist."
           fi

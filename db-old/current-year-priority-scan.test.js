@@ -158,6 +158,33 @@ test('a scheduled priority scan defers after sustained technical errors instead 
     });
 
     assert.deepEqual(result, { completed: false, runtimeLimit: false, deferred: true });
-    assert.equal(scraper.stats.errors, 50);
+    assert.equal(scraper.stats.errors, 5);
+    assert.equal(scraper.stats.notFound, 0);
+});
+
+test('the normal cycle keeps its checkpoint on a temporary SOP failure', async () => {
+    const reasons = [];
+    const scraper = new MonthlyECHRScraper({ d1: {} });
+    scraper.startScrapeRun = async () => {};
+    scraper.loadState = () => {
+        scraper.state = { version: 1, currentYear: 2016, currentNumber: 42, consecutiveEmpty: 0 };
+    };
+    scraper.saveState = reason => reasons.push(reason);
+    scraper.loadFinalizedApplicationNumbers = async () => {};
+    scraper.prepareAdministrativeRejectionTracking = async () => {};
+    scraper.scrapeWithDeadline = async () => {
+        const error = new Error('SOP unavailable');
+        error.temporary = true;
+        throw error;
+    };
+    scraper.flushBatch = async () => {};
+    scraper.printFinalStats = () => {};
+    scraper.finishScrapeRun = async () => {};
+    scraper.persistPortfolioStageChanges = () => {};
+
+    await scraper.run();
+
+    assert.equal(scraper.state.currentNumber, 42);
+    assert.ok(reasons.includes('temporary-source-error'));
     assert.equal(scraper.stats.notFound, 0);
 });

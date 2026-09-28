@@ -55,27 +55,46 @@ jobs:
           HUMAN_RIGHTS_DAILY_UPDATE_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
           HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
         run: |
-          set -euo pipefail
-          test -n "$HUMAN_RIGHTS_DAILY_UPDATE_URL"
-          test -n "$HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET"
+          set -uo pipefail
+          if [ -z "$HUMAN_RIGHTS_DAILY_UPDATE_URL" ] || [ -z "$HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET" ]; then
+            echo "::warning::Panel günlük güncelleme endpointi yapılandırılmamış. SOP/D1 taraması korundu; panel kuyruğu sonraki çalışmada yeniden denenecek."
+            exit 0
+          fi
           endpoint="${HUMAN_RIGHTS_DAILY_UPDATE_URL%/}"
           case "$endpoint" in
             */api/human-rights/daily-update) ;;
             *) endpoint="$endpoint/api/human-rights/daily-update" ;;
           esac
-          response="$(curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+          set +e
+          response="$(curl --fail-with-body --show-error --silent --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 --request POST "$endpoint" \
             --header "Authorization: Bearer $HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET" \
             --header "Content-Type: application/json" --data '{"dryRun":false}')"
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "::warning::Panel günlük güncelleme isteği geçici olarak başarısız oldu. SOP/D1 taraması korundu; sonraki çalışmada yeniden denenecek."
+            exit 0
+          fi
           echo "$response"
-          run_id="$(echo "$response" | jq -r '.run.id // empty')"
-          test -n "$run_id"
+          run_id="$(echo "$response" | jq -r '.run.id // empty' 2>/dev/null || true)"
+          if [ -z "$run_id" ]; then
+            echo "::warning::Panel günlük güncelleme yanıtı geçerli bir run kimliği içermiyor. SOP/D1 taraması korundu."
+            exit 0
+          fi
           for attempt in $(seq 1 80); do
-            status="$(echo "$response" | jq -r '.run.status // empty')"
+            status="$(echo "$response" | jq -r '.run.status // empty' 2>/dev/null || true)"
             if [ "$status" != "running" ]; then exit 0; fi
-            response="$(curl --fail-with-body --show-error --silent --request POST "$endpoint" \
+            set +e
+            response="$(curl --fail-with-body --show-error --silent --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 --request POST "$endpoint" \
               --header "Authorization: Bearer $HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET" \
               --header "Content-Type: application/json" --data "{\"runId\":\"$run_id\"}")"
+            curl_exit=$?
+            set -e
+            if [ "$curl_exit" -ne 0 ]; then
+              echo "::warning::Panel günlük güncelleme durumu alınamadı. SOP/D1 taraması korundu; sonraki çalışmada yeniden denenecek."
+              exit 0
+            fi
             echo "$response"
           done
-          echo "Daily queue did not finish within continuation limit." >&2
-          exit 1
+          echo "::warning::Panel günlük güncelleme kuyruğu süre sınırı içinde tamamlanmadı. SOP/D1 taraması korundu; sonraki çalışmada yeniden denenecek."
+          exit 0
