@@ -70,6 +70,7 @@ jobs:
         run: node monthly-scraper.js
 
       - name: Refresh HukukiPanel AİHM published data
+        id: published_snapshot
         if: success()
         env:
           # Günlük SOP ile aynı, doğrulanmış eski/yeni secret zincirini kullan.
@@ -88,10 +89,15 @@ jobs:
             */api/*) endpoint="${endpoint%/api/*}/api/echr-db/refresh?wait=1" ;;
             *) endpoint="$endpoint/api/echr-db/refresh?wait=1" ;;
           esac
-          # Başvuru kartları D1'in yayımlanmış özet sürümünden okunur. Bu
-          # endpoint yoksa veya özet, ham `applications` sayısına ulaşmazsa
-          # tarama başarılı sayılmaz: yeni kayıtlar ekranda görünmez kalır.
+          # Yeni panel sürümü yayımlanmış özet kullanır. Eski üretim sürümü
+          # ise Cloudflare D1'i doğrudan okur; bu durumda endpointin 404
+          # dönmesi, scraper verisinin görünmediği anlamına gelmez.
           preflight_status="$(curl --silent --show-error --retry 3 --retry-all-errors --connect-timeout 15 --max-time 30 --output /dev/null --write-out '%{http_code}' "$endpoint" || true)"
+          if [ "$preflight_status" = "404" ]; then
+            echo "::notice::Üretim paneli AİHM verilerini Cloudflare D1'den doğrudan okuyor; özet yenilemesi gerekmiyor."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$preflight_status" != "200" ]; then
             echo "::error::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü."
             exit 1
@@ -110,9 +116,10 @@ jobs:
             head -c 2000 "$response_file" || true
             exit 1
           fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Notify portfolio stage changes
-        if: success()
+        if: success() && steps.published_snapshot.outputs.available == 'true'
         env:
           PORTFOLIO_NOTIFICATION_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
           PORTFOLIO_NOTIFICATION_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
