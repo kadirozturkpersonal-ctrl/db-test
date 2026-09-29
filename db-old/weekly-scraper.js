@@ -12,6 +12,7 @@
 
 require('dotenv').config();
 const fs = require('fs');
+const crypto = require('crypto');
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
 const { log } = require('./debug');
@@ -26,6 +27,10 @@ class WeeklyECHRScraper {
 		this.databaseName = databaseName;
 		this.browser = null;
 		this.sourceUnavailable = false;
+		this.runId = crypto.randomUUID();
+		this.runStartedAt = new Date().toISOString();
+		this.currentApplicationNumber = null;
+		this.processedCount = 0;
 
 		// Stats
 		this.stats = {
@@ -36,6 +41,30 @@ class WeeklyECHRScraper {
 			errors: 0
 		};
 		this.consecutiveTechnicalFailures = 0;
+	}
+
+	async startDailyRun() {
+		await this.d1.querySQL(`CREATE TABLE IF NOT EXISTS echr_scraper_runs (
+			id TEXT PRIMARY KEY, schedule_slot TEXT NOT NULL, run_mode TEXT NOT NULL, status TEXT NOT NULL,
+			started_at TEXT NOT NULL, completed_at TEXT, new_applications_added INTEGER NOT NULL DEFAULT 0,
+			applications_saved INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0, error_message TEXT
+		)`);
+		for (const column of ['current_application_number TEXT', 'processed_count INTEGER NOT NULL DEFAULT 0', 'total_count INTEGER NOT NULL DEFAULT 0', 'checked_per_minute REAL', 'last_heartbeat_at TEXT']) {
+			try { await this.d1.querySQL(`ALTER TABLE echr_scraper_runs ADD COLUMN ${column}`); }
+			catch (error) { if (!/duplicate column name/i.test(String(error?.message || error))) throw error; }
+		}
+		await this.d1.querySQL(`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at, total_count) VALUES (?, '00:07', 'daily-subscription-sop', 'running', ?, ?)`, [this.runId, this.runStartedAt, this.stats.total]);
+		await this.publishProgress();
+	}
+
+	async publishProgress() {
+		const elapsedMinutes = Math.max(1 / 60, (Date.now() - Date.parse(this.runStartedAt)) / 60000);
+		await this.d1.querySQL(`UPDATE echr_scraper_runs SET current_application_number = ?, processed_count = ?, total_count = ?, checked_per_minute = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ? WHERE id = ?`, [this.currentApplicationNumber, this.processedCount, this.stats.total, Number((this.processedCount / elapsedMinutes).toFixed(2)), this.stats.updated, this.stats.errors, new Date().toISOString(), this.runId]);
+	}
+
+	async finishDailyRun(error = null) {
+		await this.publishProgress().catch(() => undefined);
+		await this.d1.querySQL(`UPDATE echr_scraper_runs SET status = ?, completed_at = ?, error_message = ? WHERE id = ?`, [error || this.sourceUnavailable ? 'failed' : 'completed', new Date().toISOString(), error ? String(error.message || error).slice(0, 2000) : this.sourceUnavailable ? 'SOP source temporarily unavailable' : null, this.runId]).catch((publishError) => log(`   ⚠️ Could not finalize daily live progress: ${publishError.message}`, true));
 	}
 
 	/**
@@ -86,9 +115,11 @@ class WeeklyECHRScraper {
 		// Get subscribed cases
 		const subscribedCases = await this.getSubscribedCases();
 		this.stats.total = subscribedCases.length;
+		await this.startDailyRun();
 
 		if (subscribedCases.length === 0) {
 			log('\n⚠️  No subscribed cases found. Nothing to scrape.', true);
+			await this.finishDailyRun();
 			return;
 		}
 
@@ -98,10 +129,12 @@ class WeeklyECHRScraper {
 		// Launch browser ONCE for the entire run
 		this.browser = await this.createBrowser();
 
+		let runError = null;
 		try {
 			// Process each case
 			for (let i = 0; i < subscribedCases.length; i++) {
 				const caseInfo = subscribedCases[i];
+				this.currentApplicationNumber = caseInfo.application_number;
 				const progress = `[${i + 1}/${subscribedCases.length}]`;
 
 				log(`\n${progress} Checking: ${caseInfo.application_number}`, true);
@@ -180,6 +213,8 @@ class WeeklyECHRScraper {
 				// Rate limiting - be nice to ECHR servers
 				// Wait 500ms between requests
 				await this.sleep(300);
+				this.processedCount++;
+				await this.publishProgress();
 			}
 
 			if (this.sourceUnavailable) {
@@ -190,6 +225,9 @@ class WeeklyECHRScraper {
 			this.printStats();
 			this.writeWorkflowOutcome();
 			return { sourceAvailable: !this.sourceUnavailable };
+		} catch (error) {
+			runError = error;
+			throw error;
 		} finally {
 			// Always close the browser, even if an error occurred
 			if (this.browser) {
@@ -198,6 +236,7 @@ class WeeklyECHRScraper {
 					log(`   ⚠️  Could not close browser: ${error.message}`, true);
 				});
 			}
+			await this.finishDailyRun(runError);
 		}
 	}
 
