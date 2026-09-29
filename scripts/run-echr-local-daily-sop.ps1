@@ -63,6 +63,11 @@ foreach ($name in $requiredNames) {
     }
 }
 
+$systemChrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+if (Test-Path -LiteralPath $systemChrome) {
+    $env:ECHR_BROWSER_EXECUTABLE_PATH = $systemChrome
+}
+
 # The daily subscription check and the full scraper share one browser/D1 writer.
 # Do not overlap them if a delayed daytime run is still in progress.
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')

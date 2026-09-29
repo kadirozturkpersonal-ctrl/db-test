@@ -63,6 +63,10 @@ $env:MAX_RUNTIME_MINUTES = '330'
 $env:SAFE_STOP_BUFFER_MINUTES = '15'
 $env:SCRAPE_ATTEMPT_TIMEOUT_MS = '60000'
 $env:BROWSER_MAX_UPTIME_MINUTES = '90'
+$systemChrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+if (Test-Path -LiteralPath $systemChrome) {
+    $env:ECHR_BROWSER_EXECUTABLE_PATH = $systemChrome
+}
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
 if (-not $mutex.WaitOne(0)) {

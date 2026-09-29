@@ -34,8 +34,10 @@ function sleep(ms) {
  */
 async function createBrowser() {
 	log('🌐 Launching browser (will be reused for all cases)...', true);
+	const executablePath = String(process.env.ECHR_BROWSER_EXECUTABLE_PATH || '').trim();
 	return await chromium.launch({
 		headless: true,
+		...(executablePath ? { executablePath } : {}),
 		timeout: 30000
 	});
 }
