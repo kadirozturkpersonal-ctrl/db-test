@@ -1,10 +1,9 @@
-const { chromium: rawChromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { chromium } = require('playwright');
 const { log } = require('./debug');
 
-// Apply stealth plugin once when module loads
-rawChromium.use(StealthPlugin());
-const chromium = rawChromium;
+// Native Playwright is deliberately used for the local scheduler. The
+// playwright-extra/Puppeteer compatibility layer cannot spawn Chromium
+// reliably under Windows Task Scheduler.
 
 const DEFAULT_MAX_RETRIES = 2;
 // GitHub-hosted runners can need noticeably longer than a local browser before
