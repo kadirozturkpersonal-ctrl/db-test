@@ -16,14 +16,28 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 18)
+
+$dailySopSettings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 5 -Minutes 45)
 
 $definitions = @(
-    # A colon is not valid in a Windows Task Scheduler task name.
-    @{ Name = 'ECHR Scraper - 0600'; Time = '06:00'; CurrentYear = $true },
-    @{ Name = 'ECHR Scraper - 1200'; Time = '12:00'; CurrentYear = $false },
-    @{ Name = 'ECHR Scraper - 1800'; Time = '18:00'; CurrentYear = $false }
+    # A colon is not valid in a Windows Task Scheduler task name.  This single
+    # run has a dynamic deadline of 23:45, so it checkpoints before midnight.
+    @{ Name = 'ECHR Scraper - 0600'; Time = '06:00'; CurrentYear = $true }
 )
+
+# Retire the two former slots so they cannot create a second browser session
+# or duplicate requests during the continuous daytime run.
+foreach ($legacyTask in 'ECHR Scraper - 1200', 'ECHR Scraper - 1800') {
+    if (Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false
+    }
+}
 
 foreach ($definition in $definitions) {
     $arguments = '"{0}" "{1}" -Slot "{2}"' -f $hiddenLauncher, $runner, $definition.Time
@@ -43,6 +57,6 @@ $dailySopArguments = '"{0}" "{1}"' -f $hiddenLauncher, $dailySopRunner
 $dailySopCommand = '"{0}" {1}' -f "$env:WINDIR\System32\wscript.exe", $dailySopArguments
 & schtasks.exe /Create /TN 'ECHR Daily SOP Check - 0007' /TR $dailySopCommand /SC DAILY /ST '00:07' /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Günlük SOP görevi oluşturulamadı.' }
-Set-ScheduledTask -TaskName 'ECHR Daily SOP Check - 0007' -Settings $settings | Out-Null
+Set-ScheduledTask -TaskName 'ECHR Daily SOP Check - 0007' -Settings $dailySopSettings | Out-Null
 
 Get-ScheduledTask -TaskName 'ECHR Scraper -*', 'ECHR Daily SOP Check - 0007' | Select-Object TaskName, State

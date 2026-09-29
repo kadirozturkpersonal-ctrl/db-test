@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('06:00', '12:00', '18:00', 'manual')]
+    [ValidateSet('06:00', 'manual')]
     [string]$Slot,
     [switch]$CurrentYearPriority
 )
@@ -59,7 +59,18 @@ $env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
 $env:SCRAPER_SCHEDULE_SLOT = $Slot
 $env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else { 'false' }
 $env:MAX_CONSECUTIVE_EMPTY = '500'
-$env:MAX_RUNTIME_MINUTES = '330'
+# One continuous daytime run is intentionally used instead of three separate
+# runs.  Keep a 15-minute margin before midnight so the scraper can checkpoint
+# and exit cleanly.  If Task Scheduler starts the task late (for example after
+# a restart), reduce the budget so it still never spills into the next day.
+$localNow = Get-Date
+$safeStopAt = $localNow.Date.AddDays(1).AddMinutes(-15)
+$remainingMinutes = [math]::Floor(($safeStopAt - $localNow).TotalMinutes)
+if ($remainingMinutes -lt 1) {
+    "[$(Get-Date -Format o)] Local ECHR scraper was started too close to midnight; no safe runtime remains." | Add-Content -LiteralPath $logPath
+    exit 0
+}
+$env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes
 $env:SAFE_STOP_BUFFER_MINUTES = '15'
 $env:SCRAPE_ATTEMPT_TIMEOUT_MS = '60000'
 $env:BROWSER_MAX_UPTIME_MINUTES = '90'
