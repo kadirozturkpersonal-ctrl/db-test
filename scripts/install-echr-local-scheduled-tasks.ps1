@@ -46,7 +46,11 @@ foreach ($definition in $definitions) {
     # local automation on this computer. Register-ScheduledTask rejects that
     # principal form on this Windows installation.
     $taskCommand = '"{0}" {1}' -f "$env:WINDIR\System32\wscript.exe", $arguments
-    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /ST $definition.Time /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
+    # Re-trigger every ten minutes throughout the daytime window.  When the
+    # scraper is healthy, IgnoreNew keeps this to one process.  If a network,
+    # browser, or power interruption ends that process, the following trigger
+    # resumes from its local checkpoint instead of waiting for the next day.
+    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /ST $definition.Time /RI 10 /DU 17:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Görev oluşturulamadı: $($definition.Name)" }
     Set-ScheduledTask -TaskName $definition.Name -Settings $settings | Out-Null
 }
