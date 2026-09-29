@@ -80,3 +80,33 @@ test('daily subscription scan writes a local source-availability outcome for the
         fs.rmSync(directory, { recursive: true, force: true });
     }
 });
+
+test('daily subscription scan writes SOP results through the batch D1 API', async () => {
+    const savedBatches = [];
+    const scraper = new WeeklyECHRScraper('echr-db', {
+        d1: {
+            async saveBatch(rows) {
+                savedBatches.push(rows);
+                return { success: rows.length, failed: 0 };
+            },
+            async querySQL() {
+                throw new Error('No not-found write is expected for this result.');
+            }
+        },
+        createBrowser: async () => ({ close: async () => {} }),
+        scrapeApplication: async () => ({
+            applicationNumber: '123/26',
+            applicationTitle: 'Example v. Türkiye',
+            lastMajorEvent: 'Pending',
+            majorEventsList: []
+        })
+    });
+    scraper.getSubscribedCases = async () => [{ application_number: '123/26', current_event: 'Pending' }];
+    scraper.sleep = async () => {};
+
+    const result = await scraper.run();
+
+    assert.deepEqual(result, { sourceAvailable: true });
+    assert.equal(savedBatches.length, 1);
+    assert.equal(savedBatches[0][0].applicationNumber, '123/26');
+});

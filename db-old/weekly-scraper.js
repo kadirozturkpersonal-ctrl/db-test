@@ -130,8 +130,13 @@ class WeeklyECHRScraper {
 							this.stats.unchanged++;
 						}
 
-						// Save to database (always update last_checked_date)
-						await this.d1.saveApplication(data);
+						// Save through the D1 Import API. The legacy single-record path
+						// shells out to Wrangler, which is not reliable in Windows Task
+						// Scheduler.
+						const saved = await this.d1.saveBatch([data]);
+						if (saved.failed > 0) {
+							throw new Error('D1 application update could not be saved.');
+						}
 
 					} else {
 						this.consecutiveTechnicalFailures = 0;
@@ -139,8 +144,17 @@ class WeeklyECHRScraper {
 						log(`   ⚠️  SOP returned no information`, true);
 						this.stats.notFound++;
 
-						// Mark as not found in database
-						await this.d1.markAsNotFound(number, year);
+						// Keep the same not-found semantics without the legacy Wrangler
+						// command runner.
+						await this.d1.querySQL(
+							`UPDATE applications
+							 SET not_found_count = not_found_count + 1,
+								 last_checked_date = DATE('now'),
+								 skip_scraping = CASE WHEN not_found_count + 1 >= 60 THEN 1 ELSE skip_scraping END,
+								 updated_at = CURRENT_TIMESTAMP
+							 WHERE application_number = ?`,
+							[`${number}/${year}`],
+						);
 					}
 
 				} catch (error) {
