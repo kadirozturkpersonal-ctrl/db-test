@@ -17,7 +17,7 @@ $outcomePath = Join-Path $runtimeDir 'daily-sop-outcome.json'
 
 trap {
     New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir -ErrorAction SilentlyContinue | Out-Null
-    "[$(Get-Date -Format o)] Daily SOP runner failed before completion: $($_.Exception.GetType().Name)" | Add-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+    "[$(Get-Date -Format o)] Daily SOP runner failed before completion: $($_.Exception.GetType().Name) - $($_.Exception.Message)" | Add-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
     exit 1
 }
 
@@ -29,27 +29,33 @@ $nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
 }
 
 function Import-SelectedEnvironmentFile {
-    param([string]$Path, [string[]]$Names)
+    param([string]$Path, [string[]]$AllowedNames)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Yerel AİHM yapılandırması bulunamadı: $Path"
     }
 
-    foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -match '^\s*(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<value>.*)\s*$') {
-            $name = $matches.name
-            if ($name -notin $Names) { continue }
-            $value = $matches.value.Trim()
-            if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-            [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    $lines = Get-Content -LiteralPath $Path
+    foreach ($environmentName in $AllowedNames) {
+        $escapedName = [regex]::Escape($environmentName)
+        $line = $lines | Where-Object { $_ -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$" } | Select-Object -Last 1
+        if ($null -eq $line) { continue }
+        $null = $line -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$"
+        $value = $matches.value.Trim()
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
         }
+        [Environment]::SetEnvironmentVariable($environmentName, $value, 'Process')
     }
 }
 
-Import-SelectedEnvironmentFile -Path $panelEnv -Names $requiredNames
-Import-SelectedEnvironmentFile -Path $panelEnv -Names $notificationNames
+Import-SelectedEnvironmentFile -Path $panelEnv -AllowedNames $requiredNames
+Import-SelectedEnvironmentFile -Path $panelEnv -AllowedNames $notificationNames
+
+if ($Preflight) {
+    $preflightValues = $requiredNames | ForEach-Object { "$_=$([Environment]::GetEnvironmentVariable($_, 'Process').Length)" }
+    "[$(Get-Date -Format o)] Daily SOP runner preflight configuration: $($preflightValues -join ', ')" | Add-Content -LiteralPath $logPath
+}
 
 foreach ($name in $requiredNames) {
     if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
