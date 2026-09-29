@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$Preflight
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -12,6 +14,12 @@ $logPath = Join-Path $logDir ("echr-daily-sop-{0}.log" -f (Get-Date -Format 'yyy
 $requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
 $notificationNames = @('ECHR_STAGE_NOTIFICATION_URL', 'ECHR_STAGE_NOTIFICATION_CRON_SECRET')
 $outcomePath = Join-Path $runtimeDir 'daily-sop-outcome.json'
+
+trap {
+    New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir -ErrorAction SilentlyContinue | Out-Null
+    "[$(Get-Date -Format o)] Daily SOP runner failed before completion: $($_.Exception.GetType().Name)" | Add-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+    exit 1
+}
 
 New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
 $nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
@@ -59,6 +67,10 @@ if (-not $mutex.WaitOne(0)) {
 
 try {
     "`n[$(Get-Date -Format o)] Starting local Human Rights Daily SOP Check" | Add-Content -LiteralPath $logPath
+    if ($Preflight) {
+        "[$(Get-Date -Format o)] Daily SOP runner preflight completed." | Add-Content -LiteralPath $logPath
+        exit 0
+    }
     Push-Location $scraperRoot
     try {
         & $nodePath d1-target.js 2>&1 | Tee-Object -FilePath $logPath -Append
