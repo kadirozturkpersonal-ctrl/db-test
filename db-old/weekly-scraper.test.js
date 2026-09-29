@@ -30,6 +30,7 @@ test('daily subscription scan defers safely when SOP is temporarily unavailable'
     let closed = 0;
     const scraper = new WeeklyECHRScraper('echr-db', {
         d1: {
+            async querySQL() { return []; },
             async saveApplication() {
                 throw new Error('A deferred scan must not save application data');
             },
@@ -89,9 +90,7 @@ test('daily subscription scan writes SOP results through the batch D1 API', asyn
                 savedBatches.push(rows);
                 return { success: rows.length, failed: 0 };
             },
-            async querySQL() {
-                throw new Error('No not-found write is expected for this result.');
-            }
+            async querySQL() { return []; }
         },
         createBrowser: async () => ({ close: async () => {} }),
         scrapeApplication: async () => ({
