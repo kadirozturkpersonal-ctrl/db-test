@@ -127,7 +127,10 @@ class MonthlyECHRScraper {
 			: Math.max(0, parseInt(config.maxScrapeRetries, 10) || 0);
 
 		// Batch configuration
-		this.BATCH_ATTEMPTS = 500;
+		// Publish to D1 in the same small, recoverable 25-attempt batches used
+		// by the former hosted workflow.  A batch may contain fewer than 25
+		// applications because empty/known application numbers are checkpoints too.
+		this.BATCH_ATTEMPTS = 25;
 		this.batchQueue = []; // Cases waiting to be written
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
