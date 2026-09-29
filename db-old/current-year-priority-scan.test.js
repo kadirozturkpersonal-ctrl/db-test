@@ -93,6 +93,28 @@ test('scraper history preserves the smallest and largest actually attempted appl
     assert.equal(scraper.compareApplicationNumbers('999/26', '1/27') < 0, true);
 });
 
+test('an active scraper run persists its live checkpoint and speed for the panel', async () => {
+    const queries = [];
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                queries.push({ sql, params });
+                return [];
+            }
+        },
+        runId: 'live-run',
+        scheduleSlot: '12:00'
+    });
+    scraper.recordScannedApplication('14852/26');
+    scraper.stats.totalChecked = 25;
+    await scraper.startScrapeRun();
+
+    const progress = queries.find(query => /UPDATE echr_scraper_runs[\s\S]*last_heartbeat_at/.test(query.sql));
+    assert.ok(progress);
+    assert.equal(progress.params[0], '14852/26');
+    assert.equal(progress.params.at(-1), 'live-run');
+});
+
 test('existing-number lookup stays below the Cloudflare D1 bind-variable limit', async () => {
     const lookups = [];
     const scraper = new MonthlyECHRScraper({

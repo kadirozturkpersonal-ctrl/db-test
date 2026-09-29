@@ -95,6 +95,8 @@ class MonthlyECHRScraper {
 		this.largestScannedApplicationNumber = null;
 		this.browser = null;
 		this.browserStartedAt = null;
+		this.currentApplicationNumber = null;
+		this.progressUpdatePromise = Promise.resolve();
 		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
 		this.browserMaxUptimeMs =
 			(config.browserMaxUptimeMinutes || DEFAULT_BROWSER_MAX_UPTIME_MINUTES) * 60 * 1000;
@@ -620,14 +622,57 @@ class MonthlyECHRScraper {
 				largest_application_number TEXT
 			)`,
 		);
+		for (const column of [
+			'current_application_number TEXT',
+			'processed_count INTEGER NOT NULL DEFAULT 0',
+			'checked_per_minute REAL',
+			'last_heartbeat_at TEXT'
+		]) {
+			try {
+				await this.d1.querySQL(`ALTER TABLE echr_scraper_runs ADD COLUMN ${column}`);
+			} catch (error) {
+				// Existing installations already have these columns after the first
+				// local run. Any other schema failure must remain visible.
+				if (!/duplicate column name/i.test(String(error?.message || error))) throw error;
+			}
+		}
 		await this.d1.querySQL(
 			`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at) VALUES (?, ?, ?, 'running', ?)`,
 			[this.runId, this.scheduleSlot, this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle', this.runStartedAt],
 		);
+		await this.queueProgressUpdate();
+	}
+
+	queueProgressUpdate() {
+		const metrics = this.getRuntimeMetrics();
+		const now = new Date().toISOString();
+		this.progressUpdatePromise = this.progressUpdatePromise
+			.catch(() => undefined)
+			.then(() => this.d1.querySQL(
+				`UPDATE echr_scraper_runs
+				 SET current_application_number = ?, processed_count = ?, checked_per_minute = ?,
+					 new_applications_added = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ?
+				 WHERE id = ?`,
+				[
+					this.currentApplicationNumber,
+					metrics.processed,
+					Number(metrics.checkedPerMinute),
+					this.newApplicationsAdded,
+					this.stats.d1Saved,
+					this.stats.errors,
+					now,
+					this.runId,
+				],
+			))
+			.catch((error) => {
+				log(`   ⚠️ Could not persist live scraper progress: ${error.message}`, true);
+			});
+		return this.progressUpdatePromise;
 	}
 
 	async finishScrapeRun(error = null) {
 		const message = error ? String(error.message || error).slice(0, 2000) : null;
+		await this.progressUpdatePromise;
 		await this.d1.querySQL(
 			`UPDATE echr_scraper_runs
 			 SET status = ?, completed_at = ?, new_applications_added = ?, applications_saved = ?, error_count = ?, error_message = ?
@@ -655,6 +700,7 @@ class MonthlyECHRScraper {
 	recordScannedApplication(applicationNumber) {
 		const value = String(applicationNumber || '').trim();
 		if (!value) return;
+		this.currentApplicationNumber = value;
 		if (!this.smallestScannedApplicationNumber || this.compareApplicationNumbers(value, this.smallestScannedApplicationNumber) < 0) {
 			this.smallestScannedApplicationNumber = value;
 		}
@@ -959,6 +1005,7 @@ class MonthlyECHRScraper {
 		log(`D1: ${this.stats.d1Saved} app saved, ${this.stats.d1Failed} app failed, ${this.stats.noInfoSaved} no-info saved, ${this.stats.noInfoFailed} no-info failed`, true);
 		log(`Flushes: ${this.stats.flushes} | Avg D1 write: ${metrics.avgD1WriteMs}ms | Queue: ${this.batchQueue.length} apps/${this.noInfoQueue.length} no-info`, true);
 		log(`${'='.repeat(60) + '\n'}`, true);
+		void this.queueProgressUpdate();
 	}
 
 	/**
