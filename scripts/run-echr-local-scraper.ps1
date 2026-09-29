@@ -15,7 +15,13 @@ $runtimeDir = Join-Path $repoRoot 'local-data'
 $logDir = Join-Path $runtimeDir 'logs'
 $logPath = Join-Path $logDir ("echr-scraper-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 $requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
-$nodePath = (Get-Command node -ErrorAction Stop).Source
+
+New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
+$nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
+    'C:\Program Files\nodejs\node.exe'
+} else {
+    (Get-Command node -ErrorAction Stop).Source
+}
 
 function Import-SelectedEnvironmentFile {
     param([string]$Path, [string[]]$Names)
@@ -37,7 +43,6 @@ function Import-SelectedEnvironmentFile {
     }
 }
 
-New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
 Import-SelectedEnvironmentFile -Path $panelEnv -Names $requiredNames
 
 foreach ($name in $requiredNames) {

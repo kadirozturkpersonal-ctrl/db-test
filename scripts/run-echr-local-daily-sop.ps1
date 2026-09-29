@@ -12,7 +12,13 @@ $logPath = Join-Path $logDir ("echr-daily-sop-{0}.log" -f (Get-Date -Format 'yyy
 $requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
 $notificationNames = @('ECHR_STAGE_NOTIFICATION_URL', 'ECHR_STAGE_NOTIFICATION_CRON_SECRET')
 $outcomePath = Join-Path $runtimeDir 'daily-sop-outcome.json'
-$nodePath = (Get-Command node -ErrorAction Stop).Source
+
+New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
+$nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
+    'C:\Program Files\nodejs\node.exe'
+} else {
+    (Get-Command node -ErrorAction Stop).Source
+}
 
 function Import-SelectedEnvironmentFile {
     param([string]$Path, [string[]]$Names)
@@ -34,7 +40,6 @@ function Import-SelectedEnvironmentFile {
     }
 }
 
-New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
 Import-SelectedEnvironmentFile -Path $panelEnv -Names $requiredNames
 Import-SelectedEnvironmentFile -Path $panelEnv -Names $notificationNames
 
