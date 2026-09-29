@@ -209,11 +209,19 @@ class WeeklyECHRScraper {
 	}
 
 	writeWorkflowOutcome() {
-		if (!process.env.GITHUB_OUTPUT) return;
-		fs.appendFileSync(
-			process.env.GITHUB_OUTPUT,
-			`source_available=${this.sourceUnavailable ? 'false' : 'true'}\n`
-		);
+		const sourceAvailable = !this.sourceUnavailable;
+		if (process.env.GITHUB_OUTPUT) {
+			fs.appendFileSync(
+				process.env.GITHUB_OUTPUT,
+				`source_available=${sourceAvailable ? 'true' : 'false'}\n`
+			);
+		}
+		if (process.env.DAILY_SOP_OUTCOME_FILE) {
+			fs.writeFileSync(
+				process.env.DAILY_SOP_OUTCOME_FILE,
+				JSON.stringify({ sourceAvailable, stats: this.stats })
+			);
+		}
 	}
 
 	/**
