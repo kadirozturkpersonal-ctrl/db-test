@@ -6,6 +6,26 @@ const test = require('node:test');
 
 const { WeeklyECHRScraper } = require('./weekly-scraper');
 
+test('daily subscription scan reads active cases through the D1 API instead of the Wrangler shell', async () => {
+    let queried = false;
+    const scraper = new WeeklyECHRScraper('echr-db', {
+        d1: {
+            async querySQL(sql) {
+                queried = /FROM subscriptions/.test(sql);
+                return [{ application_number: '123/26', current_event: 'Pending' }];
+            },
+            executeSQL() {
+                throw new Error('The legacy Wrangler shell must not be used.');
+            }
+        }
+    });
+
+    const cases = await scraper.getSubscribedCases();
+
+    assert.equal(queried, true);
+    assert.deepEqual(cases, [{ application_number: '123/26', current_event: 'Pending' }]);
+});
+
 test('daily subscription scan defers safely when SOP is temporarily unavailable', async () => {
     let closed = 0;
     const scraper = new WeeklyECHRScraper('echr-db', {

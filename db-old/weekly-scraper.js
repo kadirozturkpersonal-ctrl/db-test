@@ -59,18 +59,12 @@ class WeeklyECHRScraper {
 		`;
 
 		try {
-			const result = this.d1.executeSQL(sql);
+			// Use the D1 REST client rather than the legacy Wrangler shell command.
+			// The shell command loses its multi-line SQL argument under Windows Task
+			// Scheduler, while querySQL sends the same query directly to D1.
+			const cases = await this.d1.querySQL(sql);
 
-			// Parse the JSON result from wrangler
-			const jsonMatch = result.match(/\[[\s\S]*\]/);
-			if (!jsonMatch) {
-				throw new Error('Could not parse database response');
-			}
-
-			const data = JSON.parse(jsonMatch[0]);
-			const cases = data[0]?.results || [];
-
-			log(`✅ Found ${cases.length} subscribed cases to check (TESTING MODE)\n`, true);
+			log(`✅ Found ${cases.length} subscribed cases to check\n`, true);
 			return cases;
 
 		} catch (error) {
