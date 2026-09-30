@@ -100,6 +100,7 @@ class MonthlyECHRScraper {
 		this.currentApplicationNumber = null;
 		this.firstScannedApplicationNumber = null;
 		this.currentPhase = this.runCurrentYearPriorityScan ? 'current-year-priority' : 'historical-cycle';
+		this.phaseTelemetry = new Map();
 		this.progressUpdatePromise = Promise.resolve();
 		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
 		this.browserMaxUptimeMs =
@@ -651,6 +652,22 @@ class MonthlyECHRScraper {
 				largest_application_number TEXT
 			)`,
 		);
+		await this.d1.querySQL(
+			`CREATE TABLE IF NOT EXISTS echr_scraper_phase_summaries (
+				run_id TEXT NOT NULL,
+				phase TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				completed_at TEXT NOT NULL,
+				first_application_number TEXT,
+				last_application_number TEXT,
+				processed_count INTEGER NOT NULL DEFAULT 0,
+				checked_per_minute REAL NOT NULL DEFAULT 0,
+				new_applications_added INTEGER NOT NULL DEFAULT 0,
+				applications_saved INTEGER NOT NULL DEFAULT 0,
+				error_count INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (run_id, phase)
+			)`,
+		);
 		for (const column of [
 			'current_application_number TEXT',
 			'first_application_number TEXT',
@@ -671,11 +688,74 @@ class MonthlyECHRScraper {
 			`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at) VALUES (?, ?, ?, 'running', ?)`,
 			[this.runId, this.scheduleSlot, this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle', this.runStartedAt],
 		);
+		this.beginPhaseTelemetry(this.currentPhase);
 		await this.queueProgressUpdate();
 	}
 
-	queueProgressUpdate() {
+	beginPhaseTelemetry(phase) {
+		if (this.phaseTelemetry.has(phase)) return;
 		const metrics = this.getRuntimeMetrics();
+		this.phaseTelemetry.set(phase, {
+			startedAt: new Date().toISOString(),
+			firstApplicationNumber: this.firstScannedApplicationNumber,
+			currentApplicationNumber: this.currentApplicationNumber,
+			baselineProcessed: metrics.processed,
+			baselineChecked: this.stats.totalChecked,
+			baselineNewApplications: this.newApplicationsAdded,
+			baselineApplicationsSaved: this.stats.d1Saved,
+			baselineErrors: this.stats.errors,
+			completedAt: null,
+		});
+	}
+
+	getPhaseTelemetry(phase = this.currentPhase) {
+		this.beginPhaseTelemetry(phase);
+		const telemetry = this.phaseTelemetry.get(phase);
+		const elapsedMinutes = Math.max((Date.now() - Date.parse(telemetry.startedAt)) / 60000, 1 / 60);
+		const metrics = this.getRuntimeMetrics();
+		const processed = Math.max(0, metrics.processed - telemetry.baselineProcessed);
+		const checked = Math.max(0, this.stats.totalChecked - telemetry.baselineChecked);
+		return {
+			...telemetry,
+			processed,
+			checkedPerMinute: Number((checked / elapsedMinutes).toFixed(2)),
+			newApplicationsAdded: Math.max(0, this.newApplicationsAdded - telemetry.baselineNewApplications),
+			applicationsSaved: Math.max(0, this.stats.d1Saved - telemetry.baselineApplicationsSaved),
+			errorCount: Math.max(0, this.stats.errors - telemetry.baselineErrors),
+		};
+	}
+
+	async completePhaseTelemetry(phase = this.currentPhase) {
+		const telemetry = this.phaseTelemetry.get(phase);
+		if (!telemetry || telemetry.completedAt) return;
+		const completedAt = new Date().toISOString();
+		telemetry.completedAt = completedAt;
+		const summary = this.getPhaseTelemetry(phase);
+		await this.d1.querySQL(
+			`INSERT INTO echr_scraper_phase_summaries (
+				run_id, phase, started_at, completed_at, first_application_number, last_application_number,
+				processed_count, checked_per_minute, new_applications_added, applications_saved, error_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(run_id, phase) DO UPDATE SET
+				completed_at = excluded.completed_at,
+				first_application_number = excluded.first_application_number,
+				last_application_number = excluded.last_application_number,
+				processed_count = excluded.processed_count,
+				checked_per_minute = excluded.checked_per_minute,
+				new_applications_added = excluded.new_applications_added,
+				applications_saved = excluded.applications_saved,
+				error_count = excluded.error_count`,
+			[
+				this.runId, phase, summary.startedAt, completedAt,
+				summary.firstApplicationNumber, summary.currentApplicationNumber,
+				summary.processed, summary.checkedPerMinute, summary.newApplicationsAdded,
+				summary.applicationsSaved, summary.errorCount,
+			],
+		);
+	}
+
+	queueProgressUpdate() {
+		const metrics = this.getPhaseTelemetry();
 		const now = new Date().toISOString();
 		this.progressUpdatePromise = this.progressUpdatePromise
 			.catch(() => undefined)
@@ -685,14 +765,14 @@ class MonthlyECHRScraper {
 					 new_applications_added = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ?
 				 WHERE id = ?`,
 				[
-					this.currentApplicationNumber,
-					this.firstScannedApplicationNumber,
+					metrics.currentApplicationNumber,
+					metrics.firstApplicationNumber,
 					this.currentPhase,
 					metrics.processed,
-					Number(metrics.checkedPerMinute),
-					this.newApplicationsAdded,
-					this.stats.d1Saved,
-					this.stats.errors,
+					metrics.checkedPerMinute,
+					metrics.newApplicationsAdded,
+					metrics.applicationsSaved,
+					metrics.errorCount,
 					now,
 					this.runId,
 				],
@@ -706,6 +786,7 @@ class MonthlyECHRScraper {
 	async finishScrapeRun(error = null) {
 		const message = error ? String(error.message || error).slice(0, 2000) : null;
 		await this.progressUpdatePromise;
+		await this.completePhaseTelemetry();
 		await this.d1.querySQL(
 			`UPDATE echr_scraper_runs
 			 SET status = ?, completed_at = ?, new_applications_added = ?, applications_saved = ?, error_count = ?, error_message = ?
@@ -735,6 +816,11 @@ class MonthlyECHRScraper {
 		if (!value) return;
 		this.currentApplicationNumber = value;
 		if (!this.firstScannedApplicationNumber) this.firstScannedApplicationNumber = value;
+		const phaseTelemetry = this.phaseTelemetry.get(this.currentPhase);
+		if (phaseTelemetry) {
+			phaseTelemetry.currentApplicationNumber = value;
+			if (!phaseTelemetry.firstApplicationNumber) phaseTelemetry.firstApplicationNumber = value;
+		}
 		if (!this.smallestScannedApplicationNumber || this.compareApplicationNumbers(value, this.smallestScannedApplicationNumber) < 0) {
 			this.smallestScannedApplicationNumber = value;
 		}
@@ -844,11 +930,15 @@ class MonthlyECHRScraper {
 			let lastLoggedYear = null;
 			let stopReason = null;
 			const startupPriority = await this.processScheduledCurrentYearScan();
+			if (this.runCurrentYearPriorityScan && startupPriority.handled) {
+				await this.completePhaseTelemetry('current-year-priority');
+			}
 			if (startupPriority.stopRun) {
 				stopReason = 'scheduled-current-year-scan';
 			}
 			if (!stopReason && this.runCurrentYearPriorityScan) {
 				this.currentPhase = 'historical-cycle';
+				this.beginPhaseTelemetry(this.currentPhase);
 				await this.queueProgressUpdate();
 			}
 

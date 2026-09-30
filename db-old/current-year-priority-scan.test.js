@@ -15,6 +15,7 @@ test('06:00 scan measures D1 max, checks the next year, then lets the historical
             }
         },
         runCurrentYearPriorityScan: true,
+        currentYearPriorityEndHour: 24,
         scrapeApplication: async () => null
     });
     scraper.browser = {};
@@ -113,6 +114,37 @@ test('an active scraper run persists its live checkpoint and speed for the panel
     assert.ok(progress);
     assert.equal(progress.params[0], '14852/26');
     assert.equal(progress.params.at(-1), 'live-run');
+});
+
+test('a completed phase keeps its own final range and D1 counters for the panel', async () => {
+    const queries = [];
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                queries.push({ sql, params });
+                return [];
+            }
+        },
+        runId: 'phase-run',
+        scheduleSlot: '06:00',
+        runCurrentYearPriorityScan: true,
+    });
+    await scraper.startScrapeRun();
+    scraper.recordScannedApplication('28652/26');
+    scraper.recordScannedApplication('28883/26');
+    scraper.stats.totalChecked = 245;
+    scraper.newApplicationsAdded = 3;
+    scraper.stats.d1Saved = 29;
+    scraper.stats.errors = 1;
+
+    await scraper.completePhaseTelemetry('current-year-priority');
+
+    const summary = queries.find((query) => /INSERT INTO echr_scraper_phase_summaries/.test(query.sql));
+    assert.ok(summary);
+    assert.deepEqual(summary.params.slice(0, 6), [
+        'phase-run', 'current-year-priority', summary.params[2], summary.params[3], '28652/26', '28883/26'
+    ]);
+    assert.deepEqual(summary.params.slice(6), [245, summary.params[7], 3, 29, 1]);
 });
 
 test('existing-number lookup stays below the Cloudflare D1 bind-variable limit', async () => {
