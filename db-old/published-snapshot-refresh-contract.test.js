@@ -16,4 +16,6 @@ test('a completed scraper run refreshes a published snapshot when available and 
     assert.match(workflow, /steps\.published_snapshot\.outputs\.available == 'true'/);
 	assert.match(workflow, /D1 tarama verisi kaydedildi; panel yenilemesi sonraki run'da yeniden denenecek/);
 	assert.match(workflow, /Checkpoint could not be pushed\. D1 writes are already durable/);
+	assert.match(workflow, /SCRAPER_RUN_SOURCE: 'github-actions'/);
+	assert.match(workflow, /SCRAPER_RUN_SOURCE_REFERENCE: \$\{\{ github\.server_url \}\}/);
 });

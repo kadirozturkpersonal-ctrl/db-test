@@ -63,6 +63,10 @@ jobs:
           BROWSER_MAX_UPTIME_MINUTES: '90'
           SCRAPER_STATE_FILE: './scraper-state.json'
           SCRAPER_FAILURE_REPORT_FILE: './scraper-failure.json'
+          # Ortak D1 çalışma geçmişinde GitHub koşularını yereldeki tarayıcıdan
+          # ayırır; yalnız yeni kayıtlar etiketlenir, mevcut kayıtlar değişmez.
+          SCRAPER_RUN_SOURCE: 'github-actions'
+          SCRAPER_RUN_SOURCE_REFERENCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SCRAPER_SCHEDULE_SLOT: ${{ github.event.schedule == '0 3 * * *' && '06:00' || github.event.schedule == '0 9 * * *' && '12:00' || github.event.schedule == '0 15 * * *' && '18:00' || 'manual' }}
           # 06:00 Türkiye çalışması, kuyruk/D1 istek kaydı olmadan doğrudan
           # 2026'nın D1'deki en yüksek numarasından 500 geriden başlar.

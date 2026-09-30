@@ -84,6 +84,32 @@ test('each scraper run records only application numbers absent before its D1 wri
     assert.match(queries.map((query) => query.sql).join('\n'), /new_applications_added/);
 });
 
+test('a run records its execution source without relabelling earlier D1 history', async () => {
+    const queries = [];
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                queries.push({ sql, params });
+                return [];
+            }
+        },
+        runId: 'github-run',
+        scheduleSlot: '12:00',
+        runSource: 'github-actions',
+        runSourceReference: 'https://github.com/example/repo/actions/runs/123'
+    });
+
+    await scraper.startScrapeRun();
+
+    const insert = queries.find(query => /INSERT INTO echr_scraper_runs/.test(query.sql));
+    assert.ok(insert);
+    assert.match(queries.map((query) => query.sql).join('\n'), /run_source TEXT NOT NULL DEFAULT 'unspecified'/);
+    assert.deepEqual(insert.params, [
+        'github-run', '12:00', 'historical-cycle', 'github-actions',
+        'https://github.com/example/repo/actions/runs/123', insert.params.at(-1)
+    ]);
+});
+
 test('scraper history preserves the smallest and largest actually attempted application numbers', async () => {
     const scraper = new MonthlyECHRScraper({ d1: {} });
     scraper.recordScannedApplication('300/27');

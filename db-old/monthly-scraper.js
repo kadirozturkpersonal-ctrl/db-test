@@ -57,7 +57,9 @@ function readEnvConfig() {
 		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
 		currentYearPriorityEndHour: parseNumber(process.env.CURRENT_YEAR_PRIORITY_END_HOUR),
 		scheduleSlot: process.env.SCRAPER_SCHEDULE_SLOT || 'manual',
-		stateFile: process.env.SCRAPER_STATE_FILE
+		stateFile: process.env.SCRAPER_STATE_FILE,
+		runSource: process.env.SCRAPER_RUN_SOURCE,
+		runSourceReference: process.env.SCRAPER_RUN_SOURCE_REFERENCE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
 
@@ -90,6 +92,8 @@ class MonthlyECHRScraper {
 		this.runCurrentYearPriorityScan = config.runCurrentYearPriorityScan === true;
 		this.currentYearPriorityEndHour = config.currentYearPriorityEndHour;
 		this.scheduleSlot = String(config.scheduleSlot || 'manual');
+		this.runSource = String(config.runSource || 'unspecified').trim() || 'unspecified';
+		this.runSourceReference = String(config.runSourceReference || '').trim() || null;
 		this.runId = config.runId || crypto.randomUUID();
 		this.runStartedAt = new Date().toISOString();
 		this.newApplicationsAdded = 0;
@@ -636,6 +640,8 @@ class MonthlyECHRScraper {
 				id TEXT PRIMARY KEY,
 				schedule_slot TEXT NOT NULL,
 				run_mode TEXT NOT NULL,
+				run_source TEXT NOT NULL DEFAULT 'unspecified',
+				run_source_reference TEXT,
 				status TEXT NOT NULL,
 				started_at TEXT NOT NULL,
 				completed_at TEXT,
@@ -669,6 +675,8 @@ class MonthlyECHRScraper {
 			)`,
 		);
 		for (const column of [
+			'run_source TEXT NOT NULL DEFAULT \'unspecified\'',
+			'run_source_reference TEXT',
 			'current_application_number TEXT',
 			'first_application_number TEXT',
 			'current_phase TEXT',
@@ -685,8 +693,17 @@ class MonthlyECHRScraper {
 			}
 		}
 		await this.d1.querySQL(
-			`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at) VALUES (?, ?, ?, 'running', ?)`,
-			[this.runId, this.scheduleSlot, this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle', this.runStartedAt],
+			`INSERT INTO echr_scraper_runs (
+				id, schedule_slot, run_mode, run_source, run_source_reference, status, started_at
+			) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+			[
+				this.runId,
+				this.scheduleSlot,
+				this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle',
+				this.runSource,
+				this.runSourceReference,
+				this.runStartedAt,
+			],
 		);
 		this.beginPhaseTelemetry(this.currentPhase);
 		await this.queueProgressUpdate();
