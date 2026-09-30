@@ -57,6 +57,9 @@ foreach ($name in $requiredNames) {
 $env:SCRAPER_STATE_FILE = Join-Path $runtimeDir 'scraper-state.json'
 $env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
 $env:SCRAPER_SCHEDULE_SLOT = $Slot
+$env:SCRAPER_RUN_SOURCE = 'local-windows-task'
+$env:SCRAPER_RUN_SOURCE_REFERENCE = 'ECHR Scraper - 0600'
+$env:SCRAPER_LOGICAL_CYCLE_ID = "local-$(Get-Date -Format 'yyyy-MM-dd')"
 $env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else { 'false' }
 $env:CURRENT_YEAR_PRIORITY_END_HOUR = '10'
 $env:MAX_CONSECUTIVE_EMPTY = '500'

@@ -106,8 +106,35 @@ test('a run records its execution source without relabelling earlier D1 history'
     assert.match(queries.map((query) => query.sql).join('\n'), /run_source TEXT NOT NULL DEFAULT 'unspecified'/);
     assert.deepEqual(insert.params, [
         'github-run', '12:00', 'historical-cycle', 'github-actions',
-        'https://github.com/example/repo/actions/runs/123', insert.params.at(-1)
+        'https://github.com/example/repo/actions/runs/123', null, insert.params.at(-1)
     ]);
+});
+
+test('a local cycle records a replaceable phase snapshot for aggregation across restarts', async () => {
+    const queries = [];
+    const scraper = new MonthlyECHRScraper({
+        d1: {
+            async querySQL(sql, params = []) {
+                queries.push({ sql, params });
+                return [];
+            }
+        },
+        runId: 'local-cycle-run',
+        runSource: 'local-windows-task',
+        logicalCycleId: 'local-2026-09-30',
+    });
+    await scraper.startScrapeRun();
+    scraper.recordScannedApplication('100/26');
+    scraper.stats.totalChecked = 25;
+    await scraper.queueProgressUpdate();
+
+    const cycleMetric = queries.find((query) => /INSERT INTO echr_scraper_cycle_phase_metrics/.test(query.sql));
+    assert.ok(cycleMetric);
+    assert.equal(cycleMetric.params[0], 'local-2026-09-30');
+    assert.equal(cycleMetric.params[1], 'local-cycle-run');
+    assert.equal(cycleMetric.params[2], 'local-windows-task');
+    assert.equal(cycleMetric.params[3], 'historical-cycle');
+    assert.match(cycleMetric.sql, /ON CONFLICT\(cycle_id, run_id, phase\) DO UPDATE/);
 });
 
 test('scraper history preserves the smallest and largest actually attempted application numbers', async () => {

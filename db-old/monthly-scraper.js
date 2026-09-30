@@ -59,7 +59,8 @@ function readEnvConfig() {
 		scheduleSlot: process.env.SCRAPER_SCHEDULE_SLOT || 'manual',
 		stateFile: process.env.SCRAPER_STATE_FILE,
 		runSource: process.env.SCRAPER_RUN_SOURCE,
-		runSourceReference: process.env.SCRAPER_RUN_SOURCE_REFERENCE
+		runSourceReference: process.env.SCRAPER_RUN_SOURCE_REFERENCE,
+		logicalCycleId: process.env.SCRAPER_LOGICAL_CYCLE_ID
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
 
@@ -94,6 +95,7 @@ class MonthlyECHRScraper {
 		this.scheduleSlot = String(config.scheduleSlot || 'manual');
 		this.runSource = String(config.runSource || 'unspecified').trim() || 'unspecified';
 		this.runSourceReference = String(config.runSourceReference || '').trim() || null;
+		this.logicalCycleId = String(config.logicalCycleId || '').trim() || null;
 		this.runId = config.runId || crypto.randomUUID();
 		this.runStartedAt = new Date().toISOString();
 		this.newApplicationsAdded = 0;
@@ -642,6 +644,7 @@ class MonthlyECHRScraper {
 				run_mode TEXT NOT NULL,
 				run_source TEXT NOT NULL DEFAULT 'unspecified',
 				run_source_reference TEXT,
+				logical_cycle_id TEXT,
 				status TEXT NOT NULL,
 				started_at TEXT NOT NULL,
 				completed_at TEXT,
@@ -651,6 +654,26 @@ class MonthlyECHRScraper {
 				error_message TEXT
 			)
 		`);
+		await this.d1.querySQL(
+			`CREATE TABLE IF NOT EXISTS echr_scraper_cycle_phase_metrics (
+				cycle_id TEXT NOT NULL,
+				run_id TEXT NOT NULL,
+				run_source TEXT NOT NULL,
+				phase TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				last_updated_at TEXT NOT NULL,
+				first_application_number TEXT,
+				current_application_number TEXT,
+				processed_count INTEGER NOT NULL DEFAULT 0,
+				checked_count INTEGER NOT NULL DEFAULT 0,
+				elapsed_minutes REAL NOT NULL DEFAULT 0,
+				new_applications_added INTEGER NOT NULL DEFAULT 0,
+				applications_saved INTEGER NOT NULL DEFAULT 0,
+				error_count INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (cycle_id, run_id, phase)
+			)`,
+		);
 		await this.d1.querySQL(
 			`CREATE TABLE IF NOT EXISTS echr_scraper_run_ranges (
 				run_id TEXT PRIMARY KEY,
@@ -677,6 +700,7 @@ class MonthlyECHRScraper {
 		for (const column of [
 			'run_source TEXT NOT NULL DEFAULT \'unspecified\'',
 			'run_source_reference TEXT',
+			'logical_cycle_id TEXT',
 			'current_application_number TEXT',
 			'first_application_number TEXT',
 			'current_phase TEXT',
@@ -694,14 +718,15 @@ class MonthlyECHRScraper {
 		}
 		await this.d1.querySQL(
 			`INSERT INTO echr_scraper_runs (
-				id, schedule_slot, run_mode, run_source, run_source_reference, status, started_at
-			) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+				id, schedule_slot, run_mode, run_source, run_source_reference, logical_cycle_id, status, started_at
+			) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
 			[
 				this.runId,
 				this.scheduleSlot,
 				this.runCurrentYearPriorityScan ? 'current-year' : 'historical-cycle',
 				this.runSource,
 				this.runSourceReference,
+				this.logicalCycleId,
 				this.runStartedAt,
 			],
 		);
@@ -735,6 +760,8 @@ class MonthlyECHRScraper {
 		return {
 			...telemetry,
 			processed,
+			elapsedMinutes,
+			checked,
 			checkedPerMinute: Number((checked / elapsedMinutes).toFixed(2)),
 			newApplicationsAdded: Math.max(0, this.newApplicationsAdded - telemetry.baselineNewApplications),
 			applicationsSaved: Math.max(0, this.stats.d1Saved - telemetry.baselineApplicationsSaved),
@@ -769,6 +796,36 @@ class MonthlyECHRScraper {
 				summary.applicationsSaved, summary.errorCount,
 			],
 		);
+		await this.upsertCyclePhaseMetric(phase, summary, completedAt);
+	}
+
+	async upsertCyclePhaseMetric(phase, metrics, completedAt = null) {
+		if (!this.logicalCycleId) return;
+		const updatedAt = completedAt || new Date().toISOString();
+		await this.d1.querySQL(
+			`INSERT INTO echr_scraper_cycle_phase_metrics (
+				cycle_id, run_id, run_source, phase, started_at, completed_at, last_updated_at,
+				first_application_number, current_application_number, processed_count, checked_count,
+				elapsed_minutes, new_applications_added, applications_saved, error_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(cycle_id, run_id, phase) DO UPDATE SET
+				completed_at = COALESCE(excluded.completed_at, echr_scraper_cycle_phase_metrics.completed_at),
+				last_updated_at = excluded.last_updated_at,
+				first_application_number = COALESCE(echr_scraper_cycle_phase_metrics.first_application_number, excluded.first_application_number),
+				current_application_number = excluded.current_application_number,
+				processed_count = excluded.processed_count,
+				checked_count = excluded.checked_count,
+				elapsed_minutes = excluded.elapsed_minutes,
+				new_applications_added = excluded.new_applications_added,
+				applications_saved = excluded.applications_saved,
+				error_count = excluded.error_count`,
+			[
+				this.logicalCycleId, this.runId, this.runSource, phase, metrics.startedAt,
+				completedAt, updatedAt, metrics.firstApplicationNumber, metrics.currentApplicationNumber,
+				metrics.processed, metrics.checked, metrics.elapsedMinutes,
+				metrics.newApplicationsAdded, metrics.applicationsSaved, metrics.errorCount,
+			],
+		);
 	}
 
 	queueProgressUpdate() {
@@ -794,6 +851,7 @@ class MonthlyECHRScraper {
 					this.runId,
 				],
 			))
+			.then(() => this.upsertCyclePhaseMetric(this.currentPhase, metrics))
 			.catch((error) => {
 				log(`   ⚠️ Could not persist live scraper progress: ${error.message}`, true);
 			});
@@ -947,7 +1005,7 @@ class MonthlyECHRScraper {
 			let lastLoggedYear = null;
 			let stopReason = null;
 			const startupPriority = await this.processScheduledCurrentYearScan();
-			if (this.runCurrentYearPriorityScan && startupPriority.handled) {
+			if (this.runCurrentYearPriorityScan) {
 				await this.completePhaseTelemetry('current-year-priority');
 			}
 			if (startupPriority.stopRun) {
