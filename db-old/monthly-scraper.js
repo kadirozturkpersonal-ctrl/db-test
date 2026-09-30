@@ -55,6 +55,7 @@ function readEnvConfig() {
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
 		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
+		currentYearPriorityEndHour: parseNumber(process.env.CURRENT_YEAR_PRIORITY_END_HOUR),
 		scheduleSlot: process.env.SCRAPER_SCHEDULE_SLOT || 'manual',
 		stateFile: process.env.SCRAPER_STATE_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
@@ -87,6 +88,7 @@ class MonthlyECHRScraper {
 		this.scrapeApplication = config.scrapeApplication || scrapeECHRApplication;
 		this.createBrowser = config.createBrowser || createBrowser;
 		this.runCurrentYearPriorityScan = config.runCurrentYearPriorityScan === true;
+		this.currentYearPriorityEndHour = config.currentYearPriorityEndHour;
 		this.scheduleSlot = String(config.scheduleSlot || 'manual');
 		this.runId = config.runId || crypto.randomUUID();
 		this.runStartedAt = new Date().toISOString();
@@ -508,6 +510,16 @@ class MonthlyECHRScraper {
 		if (!this.runCurrentYearPriorityScan) {
 			return { handled: false, stopRun: false };
 		}
+		const priorityDeadline = new Date();
+		priorityDeadline.setHours(this.currentYearPriorityEndHour ?? 10, 0, 0, 0);
+		if (Date.now() >= priorityDeadline.getTime()) {
+			log('   ℹ️ Current-year priority window has ended; continuing from the historical checkpoint.', true);
+			return { handled: false, stopRun: false };
+		}
+		const normalStopAt = this.stopNewAttemptsAt;
+		this.stopNewAttemptsAt = Math.min(normalStopAt, priorityDeadline.getTime());
+		const priorityWindowStopped = () => this.stopNewAttemptsAt < normalStopAt;
+		try {
 
 		const targetYear = new Date().getFullYear();
 		const echrYear = this.toECHRYear(targetYear);
@@ -534,7 +546,7 @@ class MonthlyECHRScraper {
 			phase: 'current-year-forward',
 			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
 		});
-		if (forward.runtimeLimit) return { handled: true, stopRun: true };
+		if (forward.runtimeLimit) return { handled: true, stopRun: !priorityWindowStopped() };
 		if (forward.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		const nextYear = targetYear + 1;
@@ -545,13 +557,13 @@ class MonthlyECHRScraper {
 			phase: 'next-year-forward',
 			stopAfterConsecutiveEmpty: CURRENT_YEAR_PRIORITY_MAX_EMPTY
 		});
-		if (nextYearCheck.runtimeLimit) return { handled: true, stopRun: true };
+		if (nextYearCheck.runtimeLimit) return { handled: true, stopRun: !priorityWindowStopped() };
 		if (nextYearCheck.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		const backwardStart = startNumber - 1;
 		if (backwardStart < 1) {
 			log('   ✅ Current-year reverse range is already at 1; scheduled scan complete.', true);
-			return { handled: true, completed: true, stopRun: true };
+			return { handled: true, completed: true, stopRun: false };
 		}
 
 		const backward = await this.scanScheduledYearDirection({
@@ -560,11 +572,14 @@ class MonthlyECHRScraper {
 			direction: -1,
 			phase: 'current-year-backward'
 		});
-		if (backward.runtimeLimit) return { handled: true, stopRun: true };
+		if (backward.runtimeLimit) return { handled: true, stopRun: !priorityWindowStopped() };
 		if (backward.deferred) return { handled: true, stopRun: true, deferred: true };
 
 		log('   ✅ Scheduled current-year forward, next-year, and reverse scan complete.', true);
-		return { handled: true, completed: true, stopRun: true };
+		return { handled: true, completed: true, stopRun: false };
+		} finally {
+			this.stopNewAttemptsAt = normalStopAt;
+		}
 	}
 
 	async loadExistingApplicationNumbers(applicationNumbers) {

@@ -58,6 +58,7 @@ $env:SCRAPER_STATE_FILE = Join-Path $runtimeDir 'scraper-state.json'
 $env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
 $env:SCRAPER_SCHEDULE_SLOT = $Slot
 $env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else { 'false' }
+$env:CURRENT_YEAR_PRIORITY_END_HOUR = '10'
 $env:MAX_CONSECUTIVE_EMPTY = '500'
 # One continuous daytime run is intentionally used instead of three separate
 # runs.  Keep a 15-minute margin before midnight so the scraper can checkpoint

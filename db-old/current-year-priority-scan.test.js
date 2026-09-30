@@ -5,7 +5,7 @@ const test = require('node:test');
 
 const { MonthlyECHRScraper } = require('./monthly-scraper');
 
-test('06:00 scan measures D1 max, checks the next year, then reverses from M-501', async () => {
+test('06:00 scan measures D1 max, checks the next year, then lets the historical cycle continue', async () => {
     const queries = [];
     const scraper = new MonthlyECHRScraper({
         d1: {
@@ -26,7 +26,7 @@ test('06:00 scan measures D1 max, checks the next year, then reverses from M-501
 
     const result = await scraper.processScheduledCurrentYearScan();
     assert.equal(result.handled, true);
-    assert.equal(result.stopRun, true);
+    assert.equal(result.stopRun, false);
     assert.match(queries[0].sql, /MAX\(/);
     assert.deepEqual(queries[0].params, [`%/${String(new Date().getFullYear()).slice(-2)}`]);
     assert.deepEqual(phases.map(phase => [phase.year, phase.startNumber, phase.direction, phase.stopAfterConsecutiveEmpty || null]), [
