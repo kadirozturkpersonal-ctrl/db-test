@@ -74,6 +74,7 @@ $env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes
 $env:SAFE_STOP_BUFFER_MINUTES = '15'
 $env:SCRAPE_ATTEMPT_TIMEOUT_MS = '60000'
 $env:BROWSER_MAX_UPTIME_MINUTES = '90'
+$env:ECHR_PUBLISHED_SNAPSHOT_REFRESH_URL = 'http://localhost:3000/api/echr-db/refresh'
 $systemChrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 if (Test-Path -LiteralPath $systemChrome) {
     $env:ECHR_BROWSER_EXECUTABLE_PATH = $systemChrome

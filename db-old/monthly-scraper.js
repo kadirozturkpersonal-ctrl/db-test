@@ -491,7 +491,16 @@ class MonthlyECHRScraper {
 		this.attemptCounter = 0;
 		this.stats.flushes++;
 		this.stats.totalD1WriteMs += Date.now() - flushStartedAt;
+		this.requestPublishedSnapshotRefresh();
 		log('='.repeat(60), true);
+	}
+
+	requestPublishedSnapshotRefresh() {
+		const url = String(process.env.ECHR_PUBLISHED_SNAPSHOT_REFRESH_URL || '').trim();
+		if (!url || typeof fetch !== 'function') return;
+		void fetch(url, { method: 'POST' }).catch((error) => {
+			log(`   ⚠️ Published panel summary refresh could not start: ${error.message}`, true);
+		});
 	}
 
 	async processScheduledCurrentYearScan() {
@@ -775,6 +784,9 @@ class MonthlyECHRScraper {
 				return { completed: true, runtimeLimit: false };
 			}
 
+			// The 06:00 priority scan uses this separate loop, so it must publish
+			// its heartbeat here as well as the historical-cycle loop below.
+			void this.queueProgressUpdate();
 			await this.sleep(250);
 		}
 
