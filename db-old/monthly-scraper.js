@@ -99,6 +99,7 @@ class MonthlyECHRScraper {
 		this.browserStartedAt = null;
 		this.currentApplicationNumber = null;
 		this.firstScannedApplicationNumber = null;
+		this.currentPhase = this.runCurrentYearPriorityScan ? 'current-year-priority' : 'historical-cycle';
 		this.progressUpdatePromise = Promise.resolve();
 		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
 		this.browserMaxUptimeMs =
@@ -653,6 +654,7 @@ class MonthlyECHRScraper {
 		for (const column of [
 			'current_application_number TEXT',
 			'first_application_number TEXT',
+			'current_phase TEXT',
 			'processed_count INTEGER NOT NULL DEFAULT 0',
 			'checked_per_minute REAL',
 			'last_heartbeat_at TEXT'
@@ -679,12 +681,13 @@ class MonthlyECHRScraper {
 			.catch(() => undefined)
 			.then(() => this.d1.querySQL(
 				`UPDATE echr_scraper_runs
-					 SET current_application_number = ?, first_application_number = ?, processed_count = ?, checked_per_minute = ?,
+					 SET current_application_number = ?, first_application_number = ?, current_phase = ?, processed_count = ?, checked_per_minute = ?,
 					 new_applications_added = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ?
 				 WHERE id = ?`,
 				[
 					this.currentApplicationNumber,
 					this.firstScannedApplicationNumber,
+					this.currentPhase,
 					metrics.processed,
 					Number(metrics.checkedPerMinute),
 					this.newApplicationsAdded,
@@ -843,6 +846,10 @@ class MonthlyECHRScraper {
 			const startupPriority = await this.processScheduledCurrentYearScan();
 			if (startupPriority.stopRun) {
 				stopReason = 'scheduled-current-year-scan';
+			}
+			if (!stopReason && this.runCurrentYearPriorityScan) {
+				this.currentPhase = 'historical-cycle';
+				await this.queueProgressUpdate();
 			}
 
 			while (!stopReason) {
