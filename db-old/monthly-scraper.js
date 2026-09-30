@@ -96,6 +96,7 @@ class MonthlyECHRScraper {
 		this.browser = null;
 		this.browserStartedAt = null;
 		this.currentApplicationNumber = null;
+		this.firstScannedApplicationNumber = null;
 		this.progressUpdatePromise = Promise.resolve();
 		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
 		this.browserMaxUptimeMs =
@@ -636,6 +637,7 @@ class MonthlyECHRScraper {
 		);
 		for (const column of [
 			'current_application_number TEXT',
+			'first_application_number TEXT',
 			'processed_count INTEGER NOT NULL DEFAULT 0',
 			'checked_per_minute REAL',
 			'last_heartbeat_at TEXT'
@@ -662,11 +664,12 @@ class MonthlyECHRScraper {
 			.catch(() => undefined)
 			.then(() => this.d1.querySQL(
 				`UPDATE echr_scraper_runs
-				 SET current_application_number = ?, processed_count = ?, checked_per_minute = ?,
+					 SET current_application_number = ?, first_application_number = ?, processed_count = ?, checked_per_minute = ?,
 					 new_applications_added = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ?
 				 WHERE id = ?`,
 				[
 					this.currentApplicationNumber,
+					this.firstScannedApplicationNumber,
 					metrics.processed,
 					Number(metrics.checkedPerMinute),
 					this.newApplicationsAdded,
@@ -713,6 +716,7 @@ class MonthlyECHRScraper {
 		const value = String(applicationNumber || '').trim();
 		if (!value) return;
 		this.currentApplicationNumber = value;
+		if (!this.firstScannedApplicationNumber) this.firstScannedApplicationNumber = value;
 		if (!this.smallestScannedApplicationNumber || this.compareApplicationNumbers(value, this.smallestScannedApplicationNumber) < 0) {
 			this.smallestScannedApplicationNumber = value;
 		}
