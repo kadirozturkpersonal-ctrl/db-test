@@ -734,13 +734,16 @@ class MonthlyECHRScraper {
 		await this.queueProgressUpdate();
 	}
 
-	beginPhaseTelemetry(phase) {
+	beginPhaseTelemetry(phase, resetRange = false) {
 		if (this.phaseTelemetry.has(phase)) return;
 		const metrics = this.getRuntimeMetrics();
 		this.phaseTelemetry.set(phase, {
 			startedAt: new Date().toISOString(),
-			firstApplicationNumber: this.firstScannedApplicationNumber,
-			currentApplicationNumber: this.currentApplicationNumber,
+			// A phase change (not initial run setup) owns a fresh range. The
+			// 10:00 historical cycle must not inherit the last 06:00–10:00
+			// priority number before it makes its first request.
+			firstApplicationNumber: resetRange ? null : this.firstScannedApplicationNumber,
+			currentApplicationNumber: resetRange ? null : this.currentApplicationNumber,
 			baselineProcessed: metrics.processed,
 			baselineChecked: this.stats.totalChecked,
 			baselineNewApplications: this.newApplicationsAdded,
@@ -1013,7 +1016,7 @@ class MonthlyECHRScraper {
 			}
 			if (!stopReason && this.runCurrentYearPriorityScan) {
 				this.currentPhase = 'historical-cycle';
-				this.beginPhaseTelemetry(this.currentPhase);
+				this.beginPhaseTelemetry(this.currentPhase, true);
 				await this.queueProgressUpdate();
 			}
 

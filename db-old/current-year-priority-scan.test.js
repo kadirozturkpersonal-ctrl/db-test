@@ -200,6 +200,24 @@ test('a completed phase keeps its own final range and D1 counters for the panel'
     assert.deepEqual(summary.params.slice(6), [245, summary.params[7], 3, 29, 1]);
 });
 
+test('the historical phase records its own first application after the priority phase', () => {
+    const scraper = new MonthlyECHRScraper({
+        d1: {},
+        runCurrentYearPriorityScan: true,
+    });
+    scraper.beginPhaseTelemetry('current-year-priority');
+    scraper.recordScannedApplication('28652/26');
+    scraper.recordScannedApplication('15930/26');
+
+    scraper.currentPhase = 'historical-cycle';
+    scraper.beginPhaseTelemetry('historical-cycle', true);
+    scraper.recordScannedApplication('15931/26');
+
+    const historical = scraper.getPhaseTelemetry('historical-cycle');
+    assert.equal(historical.firstApplicationNumber, '15931/26');
+    assert.equal(historical.currentApplicationNumber, '15931/26');
+});
+
 test('existing-number lookup stays below the Cloudflare D1 bind-variable limit', async () => {
     const lookups = [];
     const scraper = new MonthlyECHRScraper({
