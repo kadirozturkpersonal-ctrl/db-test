@@ -60,7 +60,8 @@ function readEnvConfig() {
 		stateFile: process.env.SCRAPER_STATE_FILE,
 		runSource: process.env.SCRAPER_RUN_SOURCE,
 		runSourceReference: process.env.SCRAPER_RUN_SOURCE_REFERENCE,
-		logicalCycleId: process.env.SCRAPER_LOGICAL_CYCLE_ID
+		logicalCycleId: process.env.SCRAPER_LOGICAL_CYCLE_ID,
+		activityFile: process.env.SCRAPER_ACTIVITY_FILE
 	}).filter(([, value]) => value !== undefined && value !== ''));
 }
 
@@ -96,6 +97,7 @@ class MonthlyECHRScraper {
 		this.runSource = String(config.runSource || 'unspecified').trim() || 'unspecified';
 		this.runSourceReference = String(config.runSourceReference || '').trim() || null;
 		this.logicalCycleId = String(config.logicalCycleId || '').trim() || null;
+		this.activityFile = String(config.activityFile || '').trim() || null;
 		this.runId = config.runId || crypto.randomUUID();
 		this.runStartedAt = new Date().toISOString();
 		this.newApplicationsAdded = 0;
@@ -460,6 +462,15 @@ class MonthlyECHRScraper {
 		log(`\n🚀 Writing batch to D1: ${this.batchQueue.length} cases, ${this.noInfoQueue.length} no-info candidates...`, true);
 		log('='.repeat(60), true);
 		const flushStartedAt = Date.now();
+		const savedBefore = this.stats.d1Saved;
+		const failedBefore = this.stats.d1Failed;
+		const noInfoSavedBefore = this.stats.noInfoSaved;
+		const noInfoFailedBefore = this.stats.noInfoFailed;
+		this.recordActivity('d1_batch_started', {
+			caseCount: this.batchQueue.length,
+			noInfoCandidateCount: this.noInfoQueue.length,
+			message: 'D1 yazım paketi başlatıldı.',
+		});
 
 		if (this.batchQueue.length > 0) {
 			const casesToSave = this.batchQueue;
@@ -503,6 +514,13 @@ class MonthlyECHRScraper {
 		this.stats.flushes++;
 		this.stats.totalD1WriteMs += Date.now() - flushStartedAt;
 		this.requestPublishedSnapshotRefresh();
+		this.recordActivity('d1_batch_completed', {
+			casesSaved: this.stats.d1Saved - savedBefore,
+			caseWriteErrors: this.stats.d1Failed - failedBefore,
+			noInfoSaved: this.stats.noInfoSaved - noInfoSavedBefore,
+			noInfoWriteErrors: this.stats.noInfoFailed - noInfoFailedBefore,
+			message: 'D1 yazım paketi tamamlandı.',
+		});
 		log('='.repeat(60), true);
 	}
 
@@ -772,6 +790,31 @@ class MonthlyECHRScraper {
 		};
 	}
 
+	initializeActivityFeed() {
+		if (!this.activityFile) return;
+		try {
+			fs.mkdirSync(path.dirname(this.activityFile), { recursive: true });
+			const firstLine = fs.existsSync(this.activityFile)
+				? fs.readFileSync(this.activityFile, 'utf8').split(/\r?\n/, 1)[0]
+				: '';
+			const firstEvent = firstLine ? JSON.parse(firstLine) : null;
+			if (!firstEvent || firstEvent.cycleId !== this.logicalCycleId) fs.writeFileSync(this.activityFile, '');
+			this.recordActivity('run_started', { message: 'Yerel tarama başlatıldı.' });
+		} catch (error) {
+			log(`   ⚠️  Canlı akış kaydı başlatılamadı: ${error.message}`, true);
+			this.activityFile = null;
+		}
+	}
+
+	recordActivity(type, details = {}) {
+		if (!this.activityFile) return;
+		try {
+			fs.appendFileSync(this.activityFile, `${JSON.stringify({ at: new Date().toISOString(), runId: this.runId, cycleId: this.logicalCycleId, phase: this.currentPhase, type, ...details })}\n`, 'utf8');
+		} catch (error) {
+			log(`   ⚠️  Canlı akış kaydı yazılamadı: ${error.message}`, true);
+		}
+	}
+
 	async completePhaseTelemetry(phase = this.currentPhase) {
 		const telemetry = this.phaseTelemetry.get(phase);
 		if (!telemetry || telemetry.completedAt) return;
@@ -942,10 +985,23 @@ class MonthlyECHRScraper {
 					this.batchQueue.push(data);
 					consecutiveEmpty = 0;
 					this.stats.found++;
+					this.recordActivity('found', {
+						applicationNumber,
+						title: data.applicationTitle || null,
+						representative: data.representant || null,
+						lastEvent: data.lastMajorEvent || null,
+						lastEventDate: data.lastMajorEventDate || null,
+						eventCount: Array.isArray(data.majorEventsList) ? data.majorEventsList.length : 0,
+					});
 				} else {
 					consecutiveEmpty++;
 					this.stats.notFound++;
 					this.queueNoInfoIfEligible(applicationNumber);
+					this.recordActivity('no_info', {
+						applicationNumber,
+						knownInD1: this.isKnownApplication(applicationNumber),
+						message: 'SOP bilgi döndürmedi.',
+					});
 				}
 				currentNumber += direction;
 			} catch (error) {
@@ -953,6 +1009,7 @@ class MonthlyECHRScraper {
 				this.stats.errors++;
 				const message = String(error.message || error).slice(0, 2000);
 				log(`   ❌ ${phase} error at ${applicationNumber}: ${message}`, true);
+				this.recordActivity('technical_error', { applicationNumber, message });
 				if (technicalErrorCount >= CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS) {
 					await this.flushBatch();
 					log(`   ⚠️  ${CURRENT_SCAN_MAX_CONSECUTIVE_TECHNICAL_ERRORS} consecutive ${phase} technical errors; deferring this scan to the next scheduled run.`, true);
@@ -993,6 +1050,7 @@ class MonthlyECHRScraper {
 		log(`Safe stop: no new attempts after ${new Date(this.stopNewAttemptsAt).toISOString()}`, true);
 		log(`Hard runtime target: ${new Date(this.hardStopAt).toISOString()}`, true);
 		log('='.repeat(60), true);
+		this.initializeActivityFeed();
 		await this.startScrapeRun();
 		this.loadState();
 		this.saveState('run-start');
@@ -1049,6 +1107,7 @@ class MonthlyECHRScraper {
 						this.stats.skippedFinalized++;
 						this.state.currentNumber = currentNumber + 1;
 						log(`\n[Skip #${this.stats.skippedFinalized}] ${applicationNumber} is finalized; skipping SOP check`, true);
+						this.recordActivity('finalized_skip', { applicationNumber, message: 'Kesinleşmiş kayıt; SOP sorgusu atlandı.' });
 
 						if (this.stats.skippedFinalized % this.BATCH_ATTEMPTS === 0) {
 							this.saveState('finalized-skip');
@@ -1062,6 +1121,7 @@ class MonthlyECHRScraper {
 						this.stats.skippedAdministrativeRejected++;
 						this.state.currentNumber = currentNumber + 1;
 						log(`\n[Admin reject skip #${this.stats.skippedAdministrativeRejected}] ${applicationNumber} had no SOP info for at least ${this.administrativeRejectionGraceDays} days`, true);
+						this.recordActivity('administrative_skip', { applicationNumber, message: 'İdari ret kaydı; SOP sorgusu atlandı.' });
 
 						if (this.stats.skippedAdministrativeRejected % this.BATCH_ATTEMPTS === 0) {
 							this.saveState('administrative-rejection-skip');
@@ -1089,12 +1149,25 @@ class MonthlyECHRScraper {
 							this.state.consecutiveEmpty = 0;
 
 							log(`   📦 Added to queue (${this.batchQueue.length} cases | ${this.attemptCounter}/${this.BATCH_ATTEMPTS} attempts)`, true);
+							this.recordActivity('found', {
+								applicationNumber,
+								title: data.applicationTitle || null,
+								representative: data.representant || null,
+								lastEvent: data.lastMajorEvent || null,
+								lastEventDate: data.lastMajorEventDate || null,
+								eventCount: Array.isArray(data.majorEventsList) ? data.majorEventsList.length : 0,
+							});
 						} else {
 							// Not found - increment empty counter
 							this.state.consecutiveEmpty++;
 							this.stats.notFound++;
 							this.queueNoInfoIfEligible(applicationNumber);
 							log(`   ⚠️  Empty: ${this.state.consecutiveEmpty}/${this.maxConsecutiveEmpty} | Attempts: ${this.attemptCounter}/${this.BATCH_ATTEMPTS}`, true);
+							this.recordActivity('no_info', {
+								applicationNumber,
+								knownInD1: this.isKnownApplication(applicationNumber),
+								message: 'SOP bilgi döndürmedi.',
+							});
 						}
 
 						this.state.currentNumber = currentNumber + 1;
@@ -1110,6 +1183,7 @@ class MonthlyECHRScraper {
 					} catch (error) {
 						log(`   ❌ Error: ${error.message}`, true);
 						this.stats.errors++;
+						this.recordActivity('technical_error', { applicationNumber, message: String(error.message || error) });
 
 						if (isTemporaryScrapeError(error)) {
 							// Do not advance the checkpoint. This request was not answered by SOP,

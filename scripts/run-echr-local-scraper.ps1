@@ -56,6 +56,7 @@ foreach ($name in $requiredNames) {
 # this local checkpoint even if GitHub is unreachable.
 $env:SCRAPER_STATE_FILE = Join-Path $runtimeDir 'scraper-state.json'
 $env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
+$env:SCRAPER_ACTIVITY_FILE = Join-Path $runtimeDir 'echr-scraper-live.jsonl'
 $env:SCRAPER_SCHEDULE_SLOT = $Slot
 $env:SCRAPER_RUN_SOURCE = 'local-windows-task'
 $env:SCRAPER_RUN_SOURCE_REFERENCE = 'ECHR Scraper - 0600'
