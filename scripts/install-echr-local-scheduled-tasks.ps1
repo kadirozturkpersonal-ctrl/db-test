@@ -43,7 +43,8 @@ foreach ($legacyTask in 'ECHR Scraper - 0600', 'ECHR Scraper - 1200', 'ECHR Scra
 }
 
 foreach ($definition in $definitions) {
-	$firstRunDate = (Get-Date).Date.AddDays(1).ToString('MM/dd/yyyy')
+	# schtasks.exe on this Turkish Windows installation parses /SD as dd/MM/yyyy.
+	$firstRunDate = (Get-Date).Date.AddDays(1).ToString('dd/MM/yyyy')
     $arguments = '"{0}" "{1}" -Slot "{2}"' -f $hiddenLauncher, $runner, $definition.Time
     if ($definition.CurrentYear) { $arguments += " -CurrentYearPriority -CurrentYearPriorityEndHour $($definition.PriorityEndHour)" }
     # schtasks creates the same InteractiveToken task type as the existing
