@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('06:00', 'manual')]
+    [ValidateSet('02:00', 'manual')]
     [string]$Slot,
-    [switch]$CurrentYearPriority
+    [switch]$CurrentYearPriority,
+    [ValidateRange(0, 23)]
+    [int]$CurrentYearPriorityEndHour = 6
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,10 +61,11 @@ $env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
 $env:SCRAPER_ACTIVITY_FILE = Join-Path $runtimeDir 'echr-scraper-live.jsonl'
 $env:SCRAPER_SCHEDULE_SLOT = $Slot
 $env:SCRAPER_RUN_SOURCE = 'local-windows-task'
-$env:SCRAPER_RUN_SOURCE_REFERENCE = 'ECHR Scraper - 0600'
+$env:SCRAPER_RUN_SOURCE_REFERENCE = "ECHR Scraper - $($Slot.Replace(':', ''))"
 $env:SCRAPER_LOGICAL_CYCLE_ID = "local-$(Get-Date -Format 'yyyy-MM-dd')"
 $env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else { 'false' }
-$env:CURRENT_YEAR_PRIORITY_END_HOUR = '10'
+$env:CURRENT_YEAR_PRIORITY_END_HOUR = [string]$CurrentYearPriorityEndHour
+$env:SCRAPER_REQUEST_DELAY_MS = '1350'
 $env:MAX_CONSECUTIVE_EMPTY = '500'
 # One continuous daytime run is intentionally used instead of three separate
 # runs.  Keep a 15-minute margin before midnight so the scraper can checkpoint

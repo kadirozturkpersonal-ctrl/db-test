@@ -11,6 +11,9 @@ const DEFAULT_ADMINISTRATIVE_REJECTION_GRACE_DAYS = 365;
 const DEFAULT_MAX_SCRAPE_RETRIES = 2;
 const DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS = 45_000;
 const DEFAULT_BROWSER_MAX_UPTIME_MINUTES = 90;
+// A measured, source-friendly cadence: with the typical SOP response time this
+// produces roughly 27–30 requests per minute instead of the former ~55.
+const DEFAULT_REQUEST_DELAY_MS = 1350;
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 const STATE_VERSION = 1;
 // A missing SOP panel is a source/connection health signal, not an absent
@@ -52,6 +55,7 @@ function readEnvConfig() {
 		safeStopBufferMinutes: parseNumber(process.env.SAFE_STOP_BUFFER_MINUTES),
 		scrapeAttemptTimeoutMs: parseNumber(process.env.SCRAPE_ATTEMPT_TIMEOUT_MS),
 		browserMaxUptimeMinutes: parseNumber(process.env.BROWSER_MAX_UPTIME_MINUTES),
+		requestDelayMs: parseNumber(process.env.SCRAPER_REQUEST_DELAY_MS),
 		administrativeRejectionGraceDays: parseNumber(process.env.ADMINISTRATIVE_REJECTION_GRACE_DAYS),
 		maxScrapeRetries: parseNumber(process.env.MAX_SCRAPE_RETRIES),
 		runCurrentYearPriorityScan: parseBoolean(process.env.RUN_CURRENT_YEAR_PRIORITY_SCAN),
@@ -113,6 +117,7 @@ class MonthlyECHRScraper {
 		this.scrapeAttemptTimeoutMs = config.scrapeAttemptTimeoutMs || DEFAULT_SCRAPE_ATTEMPT_TIMEOUT_MS;
 		this.browserMaxUptimeMs =
 			(config.browserMaxUptimeMinutes || DEFAULT_BROWSER_MAX_UPTIME_MINUTES) * 60 * 1000;
+		this.requestDelayMs = Math.max(0, config.requestDelayMs ?? DEFAULT_REQUEST_DELAY_MS);
 		this.startYear = START_YEAR;
 		this.cycleEndYear = this.getCycleEndYear();
 		this.maxConsecutiveEmpty =
@@ -1030,7 +1035,7 @@ class MonthlyECHRScraper {
 			// The 06:00 priority scan uses this separate loop, so it must publish
 			// its heartbeat here as well as the historical-cycle loop below.
 			void this.queueProgressUpdate();
-			await this.sleep(250);
+			await this.sleep(this.requestDelayMs);
 		}
 
 		await this.flushBatch();
@@ -1209,7 +1214,7 @@ class MonthlyECHRScraper {
 
 					// Rate limiting
 					if (stopReason) break;
-					await this.sleep(250);
+					await this.sleep(this.requestDelayMs);
 
 					// Progress update every 25 cases
 					if (this.stats.totalChecked % 25 === 0) {

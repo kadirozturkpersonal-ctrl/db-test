@@ -16,24 +16,27 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 18)
+    -ExecutionTimeLimit (New-TimeSpan -Hours 22)
 
 $dailySopSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 5 -Minutes 45)
+    # The daily task starts at 00:07. Keep a three-minute hand-off margin
+    # before the 02:00 main scraper slot without cutting into ordinary runs.
+    -ExecutionTimeLimit (New-TimeSpan -Hours 1 -Minutes 50)
 
 $definitions = @(
     # A colon is not valid in a Windows Task Scheduler task name.  This single
-    # run has a dynamic deadline of 23:45, so it checkpoints before midnight.
-    @{ Name = 'ECHR Scraper - 0600'; Time = '06:00'; CurrentYear = $true }
+    # This continuous run begins at 02:00, gives current-year checks until
+    # 06:00, then continues its historical checkpoint cycle until 23:45.
+    @{ Name = 'ECHR Scraper - 0200'; Time = '02:00'; CurrentYear = $true; PriorityEndHour = 6 }
 )
 
 # Retire the two former slots so they cannot create a second browser session
 # or duplicate requests during the continuous daytime run.
-foreach ($legacyTask in 'ECHR Scraper - 1200', 'ECHR Scraper - 1800') {
+foreach ($legacyTask in 'ECHR Scraper - 0600', 'ECHR Scraper - 1200', 'ECHR Scraper - 1800') {
     if (Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false
     }
@@ -41,7 +44,7 @@ foreach ($legacyTask in 'ECHR Scraper - 1200', 'ECHR Scraper - 1800') {
 
 foreach ($definition in $definitions) {
     $arguments = '"{0}" "{1}" -Slot "{2}"' -f $hiddenLauncher, $runner, $definition.Time
-    if ($definition.CurrentYear) { $arguments += ' -CurrentYearPriority' }
+    if ($definition.CurrentYear) { $arguments += " -CurrentYearPriority -CurrentYearPriorityEndHour $($definition.PriorityEndHour)" }
     # schtasks creates the same InteractiveToken task type as the existing
     # local automation on this computer. Register-ScheduledTask rejects that
     # principal form on this Windows installation.
@@ -50,7 +53,7 @@ foreach ($definition in $definitions) {
     # scraper is healthy, IgnoreNew keeps this to one process.  If a network,
     # browser, or power interruption ends that process, the following trigger
     # resumes from its local checkpoint instead of waiting for the next day.
-    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /ST $definition.Time /RI 10 /DU 17:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
+    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /ST $definition.Time /RI 10 /DU 21:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Görev oluşturulamadı: $($definition.Name)" }
     Set-ScheduledTask -TaskName $definition.Name -Settings $settings | Out-Null
 }
