@@ -43,6 +43,7 @@ foreach ($legacyTask in 'ECHR Scraper - 0600', 'ECHR Scraper - 1200', 'ECHR Scra
 }
 
 foreach ($definition in $definitions) {
+	$firstRunDate = (Get-Date).Date.AddDays(1).ToString('MM/dd/yyyy')
     $arguments = '"{0}" "{1}" -Slot "{2}"' -f $hiddenLauncher, $runner, $definition.Time
     if ($definition.CurrentYear) { $arguments += " -CurrentYearPriority -CurrentYearPriorityEndHour $($definition.PriorityEndHour)" }
     # schtasks creates the same InteractiveToken task type as the existing
@@ -53,7 +54,9 @@ foreach ($definition in $definitions) {
     # scraper is healthy, IgnoreNew keeps this to one process.  If a network,
     # browser, or power interruption ends that process, the following trigger
     # resumes from its local checkpoint instead of waiting for the next day.
-    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /ST $definition.Time /RI 10 /DU 21:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
+	# Do not retroactively start a daytime scan when this installer is run after
+	# 02:00. The first new schedule run is tomorrow at its declared start time.
+    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /SD $firstRunDate /ST $definition.Time /RI 10 /DU 21:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Görev oluşturulamadı: $($definition.Name)" }
     Set-ScheduledTask -TaskName $definition.Name -Settings $settings | Out-Null
 }
