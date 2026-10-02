@@ -18,13 +18,13 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 22)
 
+# The daily task starts at 00:07. Keep a three-minute hand-off margin
+# before the 02:00 main scraper slot without cutting into ordinary runs.
 $dailySopSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
-    # The daily task starts at 00:07. Keep a three-minute hand-off margin
-    # before the 02:00 main scraper slot without cutting into ordinary runs.
     -ExecutionTimeLimit (New-TimeSpan -Hours 1 -Minutes 50)
 
 $definitions = @(
