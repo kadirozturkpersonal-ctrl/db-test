@@ -113,7 +113,9 @@ try {
         $response = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body '{"dryRun":false}' -TimeoutSec 120
         "[$(Get-Date -Format o)] Panel daily update: action=$($response.action) status=$($response.run.status) phase=$($response.run.phase)" | Add-Content -LiteralPath $logPath
 
-        for ($attempt = 1; $attempt -le 80 -and $response.run.status -eq 'running'; $attempt++) {
+        # HUDOC decision control can require 65 batches before the regular
+        # SOP/D1 batches. 160 keeps the full daily cycle in this one task run.
+        for ($attempt = 1; $attempt -le 160 -and $response.run.status -eq 'running'; $attempt++) {
             Start-Sleep -Seconds 3
             $body = @{ runId = $response.run.id } | ConvertTo-Json -Compress
             $response = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 120
