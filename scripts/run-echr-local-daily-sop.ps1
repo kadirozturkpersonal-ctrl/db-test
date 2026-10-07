@@ -14,6 +14,7 @@ $logPath = Join-Path $logDir ("echr-daily-sop-{0}.log" -f (Get-Date -Format 'yyy
 $requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
 $notificationNames = @('ECHR_STAGE_NOTIFICATION_URL', 'ECHR_STAGE_NOTIFICATION_CRON_SECRET')
 $outcomePath = Join-Path $runtimeDir 'daily-sop-outcome.json'
+$activityPath = Join-Path $runtimeDir 'echr-daily-sop-activity.jsonl'
 
 trap {
     New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir -ErrorAction SilentlyContinue | Out-Null
@@ -88,7 +89,9 @@ try {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
         Remove-Item -LiteralPath $outcomePath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $activityPath -Force -ErrorAction SilentlyContinue
         $env:DAILY_SOP_OUTCOME_FILE = $outcomePath
+        $env:DAILY_SOP_ACTIVITY_FILE = $activityPath
         & $nodePath weekly-scraper.js 2>&1 | Tee-Object -FilePath $logPath -Append
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

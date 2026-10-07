@@ -31,6 +31,10 @@ class WeeklyECHRScraper {
 		this.runStartedAt = new Date().toISOString();
 		this.currentApplicationNumber = null;
 		this.processedCount = 0;
+		// The local daily runner supplies a dedicated file for the panel's
+		// per-application result view. Keep this opt-in so unrelated CLI runs
+		// do not create an activity file unexpectedly.
+		this.activityFile = process.env.DAILY_SOP_ACTIVITY_FILE || null;
 
 		// Stats
 		this.stats = {
@@ -41,6 +45,21 @@ class WeeklyECHRScraper {
 			errors: 0
 		};
 		this.consecutiveTechnicalFailures = 0;
+	}
+
+	recordActivity(type, details = {}) {
+		if (!this.activityFile) return;
+		try {
+			fs.appendFileSync(this.activityFile, `${JSON.stringify({
+				at: new Date().toISOString(),
+				runId: this.runId,
+				phase: 'daily-subscription-sop',
+				type,
+				...details,
+			})}\n`);
+		} catch (error) {
+			log(`   ⚠️ Could not record daily SOP activity: ${error.message}`, true);
+		}
 	}
 
 	async startDailyRun() {
@@ -54,6 +73,7 @@ class WeeklyECHRScraper {
 			catch (error) { if (!/duplicate column name/i.test(String(error?.message || error))) throw error; }
 		}
 		await this.d1.querySQL(`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at, total_count) VALUES (?, '00:07', 'daily-subscription-sop', 'running', ?, ?)`, [this.runId, this.runStartedAt, this.stats.total]);
+		this.recordActivity('run_started', { caseCount: this.stats.total, message: 'Yerel günlük SOP taraması başladı.' });
 		await this.publishProgress();
 	}
 
@@ -65,6 +85,10 @@ class WeeklyECHRScraper {
 	async finishDailyRun(error = null) {
 		await this.publishProgress().catch(() => undefined);
 		await this.d1.querySQL(`UPDATE echr_scraper_runs SET status = ?, completed_at = ?, error_message = ? WHERE id = ?`, [error || this.sourceUnavailable ? 'failed' : 'completed', new Date().toISOString(), error ? String(error.message || error).slice(0, 2000) : this.sourceUnavailable ? 'SOP source temporarily unavailable' : null, this.runId]).catch((publishError) => log(`   ⚠️ Could not finalize daily live progress: ${publishError.message}`, true));
+		this.recordActivity(error || this.sourceUnavailable ? 'run_failed' : 'run_completed', {
+			caseCount: this.processedCount,
+			message: error ? String(error.message || error) : this.sourceUnavailable ? 'SOP kaynağı geçici olarak kullanılamadı.' : 'Yerel günlük SOP taraması tamamlandı.',
+		});
 	}
 
 	/**
@@ -162,6 +186,14 @@ class WeeklyECHRScraper {
 							log(`   ✓ No change`, true);
 							this.stats.unchanged++;
 						}
+						this.recordActivity('found', {
+							applicationNumber: caseInfo.application_number,
+							knownInD1: true,
+							title: data.title || null,
+							lastEvent: data.lastMajorEvent || null,
+							lastEventDate: data.lastMajorEventDate || null,
+							message: hasChanged ? 'SOP kaydı bulundu · aşama değişikliği tespit edildi.' : 'SOP kaydı bulundu · değişiklik yok.',
+						});
 
 						// Save through the D1 Import API. The legacy single-record path
 						// shells out to Wrangler, which is not reliable in Windows Task
@@ -176,6 +208,11 @@ class WeeklyECHRScraper {
 						// SOP explicitly returned no information for this valid query.
 						log(`   ⚠️  SOP returned no information`, true);
 						this.stats.notFound++;
+						this.recordActivity('no_info', {
+							applicationNumber: caseInfo.application_number,
+							knownInD1: true,
+							message: 'SOP bilgi döndürmedi; mevcut D1 kaydı korundu.',
+						});
 
 						// Keep the same not-found semantics without the legacy Wrangler
 						// command runner.
@@ -193,6 +230,11 @@ class WeeklyECHRScraper {
 				} catch (error) {
 					log(`   ❌ Error: ${error.message}`, true);
 					this.stats.errors++;
+					this.recordActivity('technical_error', {
+						applicationNumber: caseInfo.application_number,
+						knownInD1: true,
+						message: String(error.message || error),
+					});
 
 					// A sequence of pages that cannot produce either an SOP result or
 					// SOP's own no-information response means the source is currently
