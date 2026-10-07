@@ -186,6 +186,13 @@ class WeeklyECHRScraper {
 							log(`   ✓ No change`, true);
 							this.stats.unchanged++;
 						}
+						// Save through the D1 Import API. The legacy single-record path
+						// shells out to Wrangler, which is not reliable in Windows Task
+						// Scheduler.
+						const saved = await this.d1.saveBatch([data]);
+						if (saved.failed > 0) {
+							throw new Error('D1 application update could not be saved.');
+						}
 						this.recordActivity('found', {
 							applicationNumber: caseInfo.application_number,
 							knownInD1: true,
@@ -194,14 +201,6 @@ class WeeklyECHRScraper {
 							lastEventDate: data.lastMajorEventDate || null,
 							message: hasChanged ? 'SOP kaydı bulundu · aşama değişikliği tespit edildi.' : 'SOP kaydı bulundu · değişiklik yok.',
 						});
-
-						// Save through the D1 Import API. The legacy single-record path
-						// shells out to Wrangler, which is not reliable in Windows Task
-						// Scheduler.
-						const saved = await this.d1.saveBatch([data]);
-						if (saved.failed > 0) {
-							throw new Error('D1 application update could not be saved.');
-						}
 
 					} else {
 						this.consecutiveTechnicalFailures = 0;
