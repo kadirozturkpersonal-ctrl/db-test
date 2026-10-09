@@ -3,6 +3,10 @@ const { log } = require('./debug');
 const { D1ImportAPI } = require('./d1-import-api');
 const { maskDatabaseId, verifyConfiguredD1Target } = require('./d1-target');
 
+// D1's DATE('now') is UTC. The panel's daily verification uses the Istanbul
+// business date, so a 00:00–02:00 Türkiye scan must not be stamped yesterday.
+const ISTANBUL_SQL_DATE = "DATE('now', '+3 hours')";
+
 /**
  * Adapter to save scraped data to Cloudflare D1 using Wrangler CLI
  */
@@ -662,7 +666,7 @@ class D1Adapter {
                     ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
                     ${lastMajorEventDate ? `'${lastMajorEventDate}'` : 'NULL'},
                     ${isClosed ? 1 : 0},
-                    DATE('now')
+                    ${ISTANBUL_SQL_DATE}
                 )
                 ON CONFLICT(application_number) DO UPDATE SET
                     application_title = excluded.application_title,
@@ -673,7 +677,7 @@ class D1Adapter {
                     last_major_event = excluded.last_major_event,
                     last_major_event_date = excluded.last_major_event_date,
                     is_closed = excluded.is_closed,
-                    last_checked_date = DATE('now'),
+                    last_checked_date = ${ISTANBUL_SQL_DATE},
                     not_found_count = 0,
                     updated_at = CURRENT_TIMESTAMP
             `;
@@ -770,7 +774,7 @@ class D1Adapter {
                         ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
                         ${lastMajorEventDate ? `'${lastMajorEventDate}'` : 'NULL'},
                         ${isClosed ? 1 : 0},
-                        DATE('now')
+                        ${ISTANBUL_SQL_DATE}
                     )
                     ON CONFLICT(application_number) DO UPDATE SET
                         application_title = excluded.application_title,
@@ -781,7 +785,7 @@ class D1Adapter {
                         last_major_event = excluded.last_major_event,
                         last_major_event_date = excluded.last_major_event_date,
                         is_closed = excluded.is_closed,
-                        last_checked_date = DATE('now'),
+                        last_checked_date = ${ISTANBUL_SQL_DATE},
                         not_found_count = 0,
                         updated_at = CURRENT_TIMESTAMP;`;
 
@@ -927,7 +931,7 @@ class D1Adapter {
                         ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
                         ${lastMajorEventDate ? `'${lastMajorEventDate}'` : 'NULL'},
                         ${isClosed ? 1 : 0},
-                        DATE('now'),
+                        ${ISTANBUL_SQL_DATE},
                         0,
                         CURRENT_TIMESTAMP
                     )
@@ -940,7 +944,7 @@ class D1Adapter {
                         last_major_event = excluded.last_major_event,
                         last_major_event_date = excluded.last_major_event_date,
                         is_closed = excluded.is_closed,
-                        last_checked_date = DATE('now'),
+                        last_checked_date = ${ISTANBUL_SQL_DATE},
                         not_found_count = 0,
                         updated_at = CURRENT_TIMESTAMP;`);
 
@@ -993,7 +997,7 @@ class D1Adapter {
                 UPDATE applications 
                 SET 
                     not_found_count = not_found_count + 1,
-                    last_checked_date = DATE('now'),
+                    last_checked_date = ${ISTANBUL_SQL_DATE},
                     skip_scraping = CASE 
                         WHEN not_found_count + 1 >= 60 THEN 1 
                         ELSE skip_scraping 
@@ -1013,4 +1017,4 @@ class D1Adapter {
     }
 }
 
-module.exports = { D1Adapter };
+module.exports = { D1Adapter, ISTANBUL_SQL_DATE };

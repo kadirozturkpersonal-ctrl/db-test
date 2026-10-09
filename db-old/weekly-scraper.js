@@ -14,7 +14,7 @@ require('dotenv').config();
 const fs = require('fs');
 const crypto = require('crypto');
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
-const { D1Adapter } = require('./d1-adapter');
+const { D1Adapter, ISTANBUL_SQL_DATE } = require('./d1-adapter');
 const { log } = require('./debug');
 
 class WeeklyECHRScraper {
@@ -218,7 +218,7 @@ class WeeklyECHRScraper {
 						await this.d1.querySQL(
 							`UPDATE applications
 							 SET not_found_count = not_found_count + 1,
-								 last_checked_date = DATE('now'),
+								 last_checked_date = ${ISTANBUL_SQL_DATE},
 								 skip_scraping = CASE WHEN not_found_count + 1 >= 60 THEN 1 ELSE skip_scraping END,
 								 updated_at = CURRENT_TIMESTAMP
 							 WHERE application_number = ?`,

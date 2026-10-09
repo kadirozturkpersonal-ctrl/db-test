@@ -13,3 +13,14 @@ test('D1 query and import clients retry only transient Cloudflare responses', ()
         assert.match(source, /AbortController/);
     }
 });
+
+test('nightly SOP writes stamp last_checked_date with the Istanbul business date', () => {
+    const adapter = fs.readFileSync(path.join(__dirname, 'd1-adapter.js'), 'utf8');
+    const weeklyScraper = fs.readFileSync(path.join(__dirname, 'weekly-scraper.js'), 'utf8');
+
+    assert.match(adapter, /const ISTANBUL_SQL_DATE = "DATE\('now', '\+3 hours'\)"/);
+    assert.match(adapter, /last_checked_date = \$\{ISTANBUL_SQL_DATE\}/);
+    assert.match(weeklyScraper, /last_checked_date = \$\{ISTANBUL_SQL_DATE\}/);
+    assert.doesNotMatch(adapter, /last_checked_date = DATE\('now'\)/);
+    assert.doesNotMatch(weeklyScraper, /last_checked_date = DATE\('now'\)/);
+});
