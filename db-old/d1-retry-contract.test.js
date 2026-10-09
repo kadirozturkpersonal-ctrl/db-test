@@ -21,6 +21,9 @@ test('nightly SOP writes stamp last_checked_date with the Istanbul business date
     assert.match(adapter, /const ISTANBUL_SQL_DATE = "DATE\('now', '\+3 hours'\)"/);
     assert.match(adapter, /last_checked_date = \$\{ISTANBUL_SQL_DATE\}/);
     assert.match(weeklyScraper, /last_checked_date = \$\{ISTANBUL_SQL_DATE\}/);
+    assert.match(weeklyScraper, /function getIstanbulDate\(\)/);
+    assert.match(weeklyScraper, /verifyDailyD1Writes\(\)/);
+    assert.match(weeklyScraper, /D1 Istanbul tarih dogrulamasi basarisiz/);
     assert.doesNotMatch(adapter, /last_checked_date = DATE\('now'\)/);
     assert.doesNotMatch(weeklyScraper, /last_checked_date = DATE\('now'\)/);
 });

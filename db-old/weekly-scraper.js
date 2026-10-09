@@ -17,6 +17,10 @@ const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require
 const { D1Adapter, ISTANBUL_SQL_DATE } = require('./d1-adapter');
 const { log } = require('./debug');
 
+function getIstanbulDate() {
+	return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Istanbul' }).format(new Date());
+}
+
 class WeeklyECHRScraper {
 	constructor(databaseName = 'echr-db', dependencies = {}) {
 		// NOTE: Weekly scraper uses Wrangler CLI (executeSQL), not Import API
@@ -35,6 +39,7 @@ class WeeklyECHRScraper {
 		// per-application result view. Keep this opt-in so unrelated CLI runs
 		// do not create an activity file unexpectedly.
 		this.activityFile = process.env.DAILY_SOP_ACTIVITY_FILE || null;
+		this.verifiedApplicationNumbers = new Set();
 
 		// Stats
 		this.stats = {
@@ -89,6 +94,39 @@ class WeeklyECHRScraper {
 			caseCount: this.processedCount,
 			message: error ? String(error.message || error) : this.sourceUnavailable ? 'SOP kaynağı geçici olarak kullanılamadı.' : 'Yerel günlük SOP taraması tamamlandı.',
 		});
+	}
+
+	/**
+	 * The panel sends a periodic email only when D1 proves that the SOP record
+	 * was checked on the current Istanbul business date.  Confirm that each
+	 * successful daily scrape has actually reached that same D1 target before
+	 * allowing the runner to call the panel notification endpoint.
+	 */
+	async verifyDailyD1Writes() {
+		if (!this.activityFile || this.verifiedApplicationNumbers.size === 0) return;
+
+		const expectedDate = getIstanbulDate();
+		const applicationNumbers = [...this.verifiedApplicationNumbers];
+		const rowsByApplicationNumber = new Map();
+
+		for (let offset = 0; offset < applicationNumbers.length; offset += 100) {
+			const batch = applicationNumbers.slice(offset, offset + 100);
+			const placeholders = batch.map(() => '?').join(', ');
+			const rows = await this.d1.querySQL(
+				`SELECT application_number, last_checked_date FROM applications WHERE application_number IN (${placeholders})`,
+				batch,
+			);
+			for (const row of rows) {
+				rowsByApplicationNumber.set(String(row.application_number || '').trim(), row.last_checked_date || null);
+			}
+		}
+
+		const stale = applicationNumbers.filter((applicationNumber) => rowsByApplicationNumber.get(applicationNumber) !== expectedDate);
+		if (stale.length > 0) {
+			throw new Error(`D1 Istanbul tarih dogrulamasi basarisiz: ${stale.length}/${applicationNumbers.length} SOP kaydi ${expectedDate} tarihini tasimiyor.`);
+		}
+
+		log(`✅ D1 Istanbul tarih doğrulaması tamamlandı: ${applicationNumbers.length}/${applicationNumbers.length} kayıt (${expectedDate})`, true);
 	}
 
 	/**
@@ -193,6 +231,7 @@ class WeeklyECHRScraper {
 						if (saved.failed > 0) {
 							throw new Error('D1 application update could not be saved.');
 						}
+						this.verifiedApplicationNumbers.add(caseInfo.application_number);
 						this.recordActivity('found', {
 							applicationNumber: caseInfo.application_number,
 							knownInD1: true,
@@ -260,6 +299,8 @@ class WeeklyECHRScraper {
 
 			if (this.sourceUnavailable) {
 				log('\n⏱️  Subscription scan deferred. No records or notifications were changed.', true);
+			} else {
+				await this.verifyDailyD1Writes();
 			}
 
 			// Print final stats
