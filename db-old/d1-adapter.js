@@ -3,9 +3,26 @@ const { log } = require('./debug');
 const { D1ImportAPI } = require('./d1-import-api');
 const { maskDatabaseId, verifyConfiguredD1Target } = require('./d1-target');
 
-// D1's DATE('now') is UTC. The panel's daily verification uses the Istanbul
-// business date, so a 00:00–02:00 Türkiye scan must not be stamped yesterday.
-const ISTANBUL_SQL_DATE = "DATE('now', '+3 hours')";
+// D1's DATE('now') is UTC. More importantly, the Import API de-duplicates an
+// identical SQL payload by its hash. A dynamic DATE('now', ...) expression
+// therefore caused an unchanged application to be treated as an old import on
+// the next day, leaving last_checked_date on yesterday. Embed today's Istanbul
+// business date in the SQL text so each daily payload is both timezone-correct
+// and unique to that business day.
+function getIstanbulBusinessDate(date = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Europe/Istanbul',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(date);
+    const value = Object.fromEntries(parts
+        .filter((part) => part.type !== 'literal')
+        .map((part) => [part.type, part.value]));
+    return `${value.year}-${value.month}-${value.day}`;
+}
+
+const ISTANBUL_SQL_DATE = `'${getIstanbulBusinessDate()}'`;
 
 /**
  * Adapter to save scraped data to Cloudflare D1 using Wrangler CLI
@@ -1017,4 +1034,4 @@ class D1Adapter {
     }
 }
 
-module.exports = { D1Adapter, ISTANBUL_SQL_DATE };
+module.exports = { D1Adapter, ISTANBUL_SQL_DATE, getIstanbulBusinessDate };
