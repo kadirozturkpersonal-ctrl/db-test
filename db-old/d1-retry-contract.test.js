@@ -28,3 +28,10 @@ test('nightly SOP writes stamp last_checked_date with the Istanbul business date
     assert.doesNotMatch(adapter, /DATE\('now', '\+3 hours'\)/);
     assert.doesNotMatch(weeklyScraper, /last_checked_date = DATE\('now'\)/);
 });
+
+test('the Istanbul business-date literal changes across midnight', () => {
+    const { getIstanbulBusinessDate } = require('./d1-adapter');
+
+    assert.equal(getIstanbulBusinessDate(new Date('2026-10-14T20:59:59.000Z')), '2026-10-14');
+    assert.equal(getIstanbulBusinessDate(new Date('2026-10-14T21:00:00.000Z')), '2026-10-15');
+});
