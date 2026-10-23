@@ -108,7 +108,7 @@ class WeeklyECHRScraper {
 			try { await this.d1.querySQL(`ALTER TABLE echr_scraper_runs ADD COLUMN ${column}`); }
 			catch (error) { if (!/duplicate column name/i.test(String(error?.message || error))) throw error; }
 		}
-		await this.d1.querySQL(`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at, total_count) VALUES (?, '00:07', 'daily-subscription-sop', 'running', ?, ?)
+		await this.d1.querySQL(`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at, total_count) VALUES (?, '00:00', 'daily-subscription-sop', 'running', ?, ?)
 			ON CONFLICT(id) DO UPDATE SET status = 'running', completed_at = NULL, error_message = NULL, total_count = excluded.total_count`, [this.runId, this.runStartedAt, this.stats.total]);
 		this.checkpoint();
 		this.recordActivity('run_started', { caseCount: this.stats.total, message: 'Yerel günlük SOP taraması başladı.' });

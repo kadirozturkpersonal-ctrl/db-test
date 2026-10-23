@@ -18,15 +18,6 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 22)
 
-# The daily task starts at 00:07. Keep a three-minute hand-off margin
-# before the 02:00 main scraper slot without cutting into ordinary runs.
-$dailySopSettings = New-ScheduledTaskSettingsSet `
-    -StartWhenAvailable `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1 -Minutes 50)
-
 $definitions = @(
     # A colon is not valid in a Windows Task Scheduler task name.  This single
     # This continuous run begins at 02:00, gives current-year checks until
@@ -65,4 +56,4 @@ foreach ($definition in $definitions) {
 # Use the same isolated recovery-aware installer when all tasks are installed.
 & (Join-Path $PSScriptRoot 'install-echr-daily-sop-task.ps1')
 
-Get-ScheduledTask -TaskName 'ECHR Scraper -*', 'ECHR Daily SOP Check - 0007' | Select-Object TaskName, State
+Get-ScheduledTask -TaskName 'ECHR Scraper -*', 'ECHR Daily SOP Check - 0000' | Select-Object TaskName, State

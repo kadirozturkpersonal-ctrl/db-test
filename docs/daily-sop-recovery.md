@@ -1,6 +1,6 @@
 # Günlük SOP görevi ve kesinti kurtarma
 
-Windows görevi `ECHR Daily SOP Check - 0007`, Türkiye saatiyle 00:07'de
+Windows görevi `ECHR Daily SOP Check - 0000`, Türkiye saatiyle 00:00'da
 başlar. 01:57'ye kadar on dakikada bir yeniden tetiklenir; `IgnoreNew` ve
 tek-süreç kilidi aynı anda ikinci tarayıcıyı önler. Görev hatalarında ayrıca
 beş dakika arayla üç yeniden başlatma bulunur. Sadece bu görevi kurmak için:
@@ -8,6 +8,9 @@ beş dakika arayla üç yeniden başlatma bulunur. Sadece bu görevi kurmak içi
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-echr-daily-sop-task.ps1
 ```
+
+Eski `ECHR Daily SOP Check - 0007` görevi silinmez; çift çalışmayı önlemek
+için devre dışı bırakılır. Geçmiş 00:07 tarama kayıtları panelde korunur.
 
 ## İşleyiş
 
