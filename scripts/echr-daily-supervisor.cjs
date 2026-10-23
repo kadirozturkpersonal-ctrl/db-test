@@ -65,6 +65,20 @@ function runChild({ filename, cwd, env, logPath, checkpointPath, reportDirectory
     });
 }
 
+async function publishFailedRun(env, checkpointPath, error) {
+    if (!fs.existsSync(checkpointPath)) return;
+    const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
+    if (!checkpoint.runId || checkpoint.date !== istanbulDate()) return;
+    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CLOUDFLARE_ACCOUNT_ID)}/d1/database/${encodeURIComponent(env.CLOUDFLARE_D1_DATABASE_ID)}/query`, {
+        method: 'POST', headers: { Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql: "UPDATE echr_scraper_runs SET status = 'failed', completed_at = ?, error_message = ? WHERE id = ? AND status = 'running'",
+            params: [new Date().toISOString(), String(error.stack || error).slice(0, 2000), checkpoint.runId] }),
+        signal: AbortSignal.timeout(10000),
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.success === false) throw new Error(`Could not publish failed daily run: HTTP ${response.status}`);
+}
+
 async function runDaily(options = {}) {
     const env = options.env || process.env;
     const runtime = options.runtime || path.resolve(__dirname, '../local-data');
@@ -136,24 +150,28 @@ async function runDaily(options = {}) {
                 }
                 if (scope.date !== date || !Array.isArray(scope.applicationNumbers)) throw new Error('Invalid or stale panel SOP manifest.');
                 writeJsonAtomic(scopePath, scope);
-                phase = 'scan'; saveState('running', { scopeCount: scope.applicationNumbers.length });
-                const result = await childRunner({
+                if (scope.run?.phase !== 'periodic') {
+                  phase = 'scan'; saveState('running', { scopeCount: scope.applicationNumbers.length });
+                  const result = await childRunner({
                     filename: path.resolve(__dirname, '../db-old/weekly-scraper.js'), cwd: path.resolve(__dirname, '../db-old'),
                     env: { ...env, DAILY_SOP_REQUIRE_PANEL_SCOPE: 'true', DAILY_SOP_SCOPE_FILE: scopePath,
                         DAILY_SOP_CHECKPOINT_FILE: checkpointPath, DAILY_SOP_OUTCOME_FILE: outcomePath,
                         DAILY_SOP_ACTIVITY_FILE: path.join(runtime, 'echr-daily-sop-activity.jsonl') },
                     logPath: path.join(logs, `echr-daily-sop-${date}-attempt-${Date.now()}.log`),
                     checkpointPath, reportDirectory: reports, deadline,
-                });
-                log(`Scraper exit: ${JSON.stringify(result)}`);
-                if (result.code !== 0) throw new Error(`Scraper failed: ${result.exitHex || result.code}; ${result.reason || result.signal || 'see attempt log'}`);
-                const outcome = JSON.parse(fs.readFileSync(outcomePath, 'utf8'));
-                if (!outcome.sourceAvailable) throw new Error('SOP scan did not complete safely.');
+                  });
+                  log(`Scraper exit: ${JSON.stringify(result)}`);
+                  if (result.code !== 0) throw new Error(`Scraper failed: ${result.exitHex || result.code}; ${result.reason || result.signal || 'see attempt log'}`);
+                  const outcome = JSON.parse(fs.readFileSync(outcomePath, 'utf8'));
+                  if (!outcome.sourceAvailable) throw new Error('SOP scan did not complete safely.');
+                }
                 phase = 'notifications'; saveState('running', { scopeCount: scope.applicationNumbers.length });
                 let response = await request({ ...(scope.run?.id ? { runId: scope.run.id } : {}) });
+                let readinessWaits = 0;
                 for (let batch = 0; response.run?.phase !== 'completed' && batch < 160; batch++) {
                     log(`Panel: ${response.action} ${response.run?.phase} ${response.run?.sync_completed}/${response.run?.sync_total}`);
-                    await delay(response.action === 'waiting_for_source' ? 30000 : 3000);
+                    if (response.action === 'waiting_for_source' && ++readinessWaits > 3) throw new Error('Panel SOP pool changed or is not ready; refreshing the manifest before retry.');
+                    await delay(response.action === 'waiting_for_source' ? 30000 : response.run?.phase === 'periodic' ? 15000 : 3000);
                     response = await request({ runId: response.run.id });
                 }
                 if (response.run?.phase !== 'completed') throw new Error('Panel delivery did not finish; same durable run will be resumed.');
@@ -170,6 +188,8 @@ async function runDaily(options = {}) {
         }
     } catch (error) {
         saveState('failed', { error: String(error.stack || error) });
+        try { await (options.publishFailure || publishFailedRun)(env, checkpointPath, error); }
+        catch (publishError) { log(`Failure-status publication failed: ${publishError.message}`); }
         throw error;
     } finally { release(); }
 }

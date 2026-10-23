@@ -16,10 +16,12 @@ trap {
 $allowedNames = @('CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_D1_DATABASE_ID',
     'ECHR_STAGE_NOTIFICATION_URL','ECHR_STAGE_NOTIFICATION_CRON_SECRET',
     'HUMAN_RIGHTS_DAILY_UPDATE_URL','HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET')
-foreach ($line in (Get-Content -LiteralPath $panelEnv)) {
-    if ($line -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$' -and $allowedNames -contains $matches[1]) {
-        $settingName = $matches[1]
-        $settingValue = $matches[2].Trim().Trim('"').Trim("'")
+foreach ($line in [System.IO.File]::ReadAllLines($panelEnv, [System.Text.Encoding]::UTF8)) {
+    $separator = $line.IndexOf('=')
+    if ($separator -lt 1) { continue }
+    $settingName = $line.Substring(0, $separator).Trim()
+    if ($allowedNames -contains $settingName) {
+        $settingValue = $line.Substring($separator + 1).Trim().Trim('"').Trim("'")
         [Environment]::SetEnvironmentVariable($settingName, $settingValue, 'Process')
     }
 }
