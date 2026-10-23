@@ -53,9 +53,7 @@ test('daily subscription scan defers safely when SOP is temporarily unavailable'
     );
     scraper.sleep = async () => {};
 
-    const result = await scraper.run();
-
-    assert.deepEqual(result, { sourceAvailable: false });
+    await assert.rejects(scraper.run(), /Daily SOP scan incomplete/);
     assert.equal(scraper.sourceUnavailable, true);
     assert.equal(scraper.stats.errors, 5);
     assert.equal(scraper.stats.notFound, 0);
@@ -82,13 +80,13 @@ test('daily subscription scan writes a local source-availability outcome for the
     }
 });
 
-test('daily subscription scan writes SOP results through the batch D1 API', async () => {
+test('daily subscription scan writes SOP results through the bounded D1 query API', async () => {
     const savedBatches = [];
     const scraper = new WeeklyECHRScraper('echr-db', {
         d1: {
-            async saveBatch(rows) {
-                savedBatches.push(rows);
-                return { success: rows.length, failed: 0 };
+            async saveDailyApplication(row) {
+                savedBatches.push([row]);
+                return { success: 1, failed: 0 };
             },
             async querySQL() { return []; }
         },

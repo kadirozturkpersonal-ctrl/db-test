@@ -1,139 +1,49 @@
 [CmdletBinding()]
-param(
-    [switch]$Preflight
-)
+param([switch]$Preflight)
 
 $ErrorActionPreference = 'Stop'
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$scraperRoot = Join-Path $repoRoot 'db-old'
 $panelEnv = 'C:\Users\kadir\Projects\hukuki-is-dosya-yonetim-paneli\.env.local'
 $runtimeDir = Join-Path $repoRoot 'local-data'
 $logDir = Join-Path $runtimeDir 'logs'
-$logPath = Join-Path $logDir ("echr-daily-sop-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
-$requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
-$notificationNames = @('ECHR_STAGE_NOTIFICATION_URL', 'ECHR_STAGE_NOTIFICATION_CRON_SECRET')
-$outcomePath = Join-Path $runtimeDir 'daily-sop-outcome.json'
-$activityPath = Join-Path $runtimeDir 'echr-daily-sop-activity.jsonl'
-
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$runnerLog = Join-Path $logDir ("echr-daily-launcher-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 trap {
-    New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir -ErrorAction SilentlyContinue | Out-Null
-    "[$(Get-Date -Format o)] Daily SOP runner failed before completion: $($_.Exception.GetType().Name) - $($_.Exception.Message)" | Add-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+    ($_ | Format-List * -Force | Out-String) | Add-Content -LiteralPath $runnerLog -Encoding UTF8
     exit 1
 }
 
-New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
-$nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
-    'C:\Program Files\nodejs\node.exe'
-} else {
-    (Get-Command node -ErrorAction Stop).Source
-}
-
-function Import-SelectedEnvironmentFile {
-    param([string]$Path, [string[]]$AllowedNames)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Yerel AİHM yapılandırması bulunamadı: $Path"
-    }
-
-    $lines = Get-Content -LiteralPath $Path
-    foreach ($environmentName in $AllowedNames) {
-        $escapedName = [regex]::Escape($environmentName)
-        $line = $lines | Where-Object { $_ -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$" } | Select-Object -Last 1
-        if ($null -eq $line) { continue }
-        $null = $line -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$"
-        $value = $matches.value.Trim()
-        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
-            $value = $value.Substring(1, $value.Length - 2)
-        }
-        [Environment]::SetEnvironmentVariable($environmentName, $value, 'Process')
+$allowedNames = @('CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_D1_DATABASE_ID',
+    'ECHR_STAGE_NOTIFICATION_URL','ECHR_STAGE_NOTIFICATION_CRON_SECRET',
+    'HUMAN_RIGHTS_DAILY_UPDATE_URL','HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET')
+foreach ($line in (Get-Content -LiteralPath $panelEnv)) {
+    if ($line -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$' -and $allowedNames -contains $matches[1]) {
+        $settingName = $matches[1]
+        $settingValue = $matches[2].Trim().Trim('"').Trim("'")
+        [Environment]::SetEnvironmentVariable($settingName, $settingValue, 'Process')
     }
 }
-
-Import-SelectedEnvironmentFile -Path $panelEnv -AllowedNames $requiredNames
-Import-SelectedEnvironmentFile -Path $panelEnv -AllowedNames $notificationNames
-
-if ($Preflight) {
-    $preflightValues = $requiredNames | ForEach-Object { "$_=$([Environment]::GetEnvironmentVariable($_, 'Process').Length)" }
-    "[$(Get-Date -Format o)] Daily SOP runner preflight configuration: $($preflightValues -join ', ')" | Add-Content -LiteralPath $logPath
+$nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') { 'C:\Program Files\nodejs\node.exe' } else { (Get-Command node -ErrorAction Stop).Source }
+if (Test-Path -LiteralPath 'C:\Program Files\Google\Chrome\Application\chrome.exe') {
+    $env:ECHR_BROWSER_EXECUTABLE_PATH = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 }
-
-foreach ($name in $requiredNames) {
-    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
-        throw "Gerekli yerel AİHM yapılandırması eksik: $name"
-    }
-}
-
-$systemChrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-if (Test-Path -LiteralPath $systemChrome) {
-    $env:ECHR_BROWSER_EXECUTABLE_PATH = $systemChrome
-}
-
-# The daily subscription check and the full scraper share one browser/D1 writer.
-# Do not overlap them if a delayed daytime run is still in progress.
+$supervisor = Join-Path $PSScriptRoot 'echr-daily-supervisor.cjs'
+if ($Preflight) { & $nodePath $supervisor --preflight; exit $LASTEXITCODE }
+$env:DAILY_SOP_DEADLINE = (Get-Date).Date.AddHours(1).AddMinutes(57).ToString('o')
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
-if (-not $mutex.WaitOne(0)) {
-    "[$(Get-Date -Format o)] Full ECHR scraper is active; daily SOP check skipped." | Add-Content -LiteralPath $logPath
-    exit 0
-}
-
+$ownsMutex = $false
 try {
-    "`n[$(Get-Date -Format o)] Starting local Human Rights Daily SOP Check" | Add-Content -LiteralPath $logPath
-    if ($Preflight) {
-        "[$(Get-Date -Format o)] Daily SOP runner preflight completed." | Add-Content -LiteralPath $logPath
-        exit 0
+    try { $ownsMutex = $mutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
+    if (-not $ownsMutex) {
+        "[$(Get-Date -Format o)] Browser/D1 writer busy; task must retry, not report success." | Add-Content -LiteralPath $runnerLog -Encoding UTF8
+        exit 75
     }
-    Push-Location $scraperRoot
-    try {
-        & $nodePath d1-target.js 2>&1 | Tee-Object -FilePath $logPath -Append
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-        Remove-Item -LiteralPath $outcomePath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $activityPath -Force -ErrorAction SilentlyContinue
-        $env:DAILY_SOP_OUTCOME_FILE = $outcomePath
-        $env:DAILY_SOP_ACTIVITY_FILE = $activityPath
-        & $nodePath weekly-scraper.js 2>&1 | Tee-Object -FilePath $logPath -Append
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-        $outcome = if (Test-Path -LiteralPath $outcomePath) { Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json } else { $null }
-        if (-not $outcome -or -not $outcome.sourceAvailable) {
-            "[$(Get-Date -Format o)] SOP source was unavailable; panel notification queue was not started." | Add-Content -LiteralPath $logPath
-            exit 0
-        }
-
-        $updateUrl = [Environment]::GetEnvironmentVariable('ECHR_STAGE_NOTIFICATION_URL', 'Process')
-        $updateSecret = [Environment]::GetEnvironmentVariable('ECHR_STAGE_NOTIFICATION_CRON_SECRET', 'Process')
-        if ([string]::IsNullOrWhiteSpace($updateUrl) -or [string]::IsNullOrWhiteSpace($updateSecret)) {
-            "[$(Get-Date -Format o)] Daily SOP check completed, but panel update credentials are not configured." | Add-Content -LiteralPath $logPath
-            exit 0
-        }
-
-        $endpoint = $updateUrl.TrimEnd('/')
-        if (-not $endpoint.EndsWith('/api/human-rights/daily-update', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $endpoint = "$endpoint/api/human-rights/daily-update"
-        }
-        $headers = @{ Authorization = "Bearer $updateSecret" }
-        $response = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body '{"dryRun":false}' -TimeoutSec 120
-        "[$(Get-Date -Format o)] Panel daily update: action=$($response.action) status=$($response.run.status) phase=$($response.run.phase)" | Add-Content -LiteralPath $logPath
-
-        # HUDOC decision control can require 65 batches before the regular
-        # SOP/D1 batches. 160 keeps the full daily cycle in this one task run.
-        for ($attempt = 1; $attempt -le 160 -and $response.run.status -eq 'running'; $attempt++) {
-            Start-Sleep -Seconds 3
-            $body = @{ runId = $response.run.id } | ConvertTo-Json -Compress
-            $response = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 120
-            "[$(Get-Date -Format o)] Panel daily update: action=$($response.action) status=$($response.run.status) phase=$($response.run.phase)" | Add-Content -LiteralPath $logPath
-        }
-        if ($response.run.status -eq 'running') {
-            "[$(Get-Date -Format o)] Panel daily update is still running; it will resume safely on the next invocation." | Add-Content -LiteralPath $logPath
-        }
-        exit 0
-    }
-    finally {
-        Pop-Location
-    }
+    # The supervisor owns stdout/stderr files; no PowerShell native-output pipeline.
+    & $nodePath $supervisor
+    exit $LASTEXITCODE
 }
 finally {
-    $mutex.ReleaseMutex() | Out-Null
+    if ($ownsMutex) { $mutex.ReleaseMutex() | Out-Null }
     $mutex.Dispose()
 }

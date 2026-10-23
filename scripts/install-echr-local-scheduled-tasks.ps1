@@ -62,12 +62,7 @@ foreach ($definition in $definitions) {
     Set-ScheduledTask -TaskName $definition.Name -Settings $settings | Out-Null
 }
 
-# Mirrors the GitHub daily subscription-stage check at 00:07 Istanbul, while
-# avoiding the top-of-hour window and sharing the same overlap protection.
-$dailySopArguments = '"{0}" "{1}"' -f $hiddenLauncher, $dailySopRunner
-$dailySopCommand = '"{0}" {1}' -f "$env:WINDIR\System32\wscript.exe", $dailySopArguments
-& schtasks.exe /Create /TN 'ECHR Daily SOP Check - 0007' /TR $dailySopCommand /SC DAILY /ST '00:07' /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Günlük SOP görevi oluşturulamadı.' }
-Set-ScheduledTask -TaskName 'ECHR Daily SOP Check - 0007' -Settings $dailySopSettings | Out-Null
+# Use the same isolated recovery-aware installer when all tasks are installed.
+& (Join-Path $PSScriptRoot 'install-echr-daily-sop-task.ps1')
 
 Get-ScheduledTask -TaskName 'ECHR Scraper -*', 'ECHR Daily SOP Check - 0007' | Select-Object TaskName, State

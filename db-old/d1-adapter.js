@@ -123,6 +123,8 @@ class D1Adapter {
             throw new Error(apiErrors?.join('; ') || `Cloudflare D1 HTTP ${response.status}`);
         }
 
+        const failedResult = payload?.result?.find(result => result.success === false);
+        if (failedResult) throw new Error(failedResult.error || 'Cloudflare D1 query failed');
         const firstResult = payload?.result?.[0];
         if (!firstResult) {
             return [];
@@ -886,6 +888,15 @@ class D1Adapter {
         }
 
         return { success: successCount, failed: failCount };
+    }
+
+    // A daily check saves one small record, not a bulk database import. Keep
+    // this on the bounded REST query path: no R2 upload, import polling,
+    // Wrangler subprocess, or fallback that can outlive the scheduled task.
+    async saveDailyApplication(data) {
+        const normalized = this.normalizeApplicationData(data);
+        await this.querySQL(this.buildBatchSQLWithReps([normalized]));
+        return { success: 1, failed: 0 };
     }
 
     /**
