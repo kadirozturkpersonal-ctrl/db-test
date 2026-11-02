@@ -110,16 +110,29 @@ async function runDaily(options = {}) {
     let attempt = 0;
     const saveState = (status, extra = {}) => writeJsonAtomic(statePath, { date, status, phase, attempt, updatedAt: new Date().toISOString(), ...extra });
     async function request(body) {
-        if (istanbulDate() !== date || Date.now() >= deadline) throw new Error('Daily business-date/runtime boundary reached.');
-        const response = await (options.fetch || fetch)(endpoint, {
-            method: body ? 'POST' : 'GET',
-            headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
-            ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(300000),
-        });
-        if (!response.ok) throw new Error(`Panel daily-update HTTP ${response.status}`);
-        const value = await response.json();
-        if (!value.ok) throw new Error(value.error || 'Invalid panel daily-update result.');
-        return value;
+        for (let requestAttempt = 1; requestAttempt <= 3; requestAttempt++) {
+            if (istanbulDate() !== date || Date.now() >= deadline) throw new Error('Daily business-date/runtime boundary reached.');
+            try {
+                const response = await (options.fetch || fetch)(endpoint, {
+                    method: body ? 'POST' : 'GET',
+                    headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+                    ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(300000),
+                });
+                if (!response.ok) {
+                    const error = new Error(`Panel daily-update HTTP ${response.status}`);
+                    error.temporaryPanel = response.status === 408 || response.status === 429 || response.status >= 500;
+                    throw error;
+                }
+                const value = await response.json();
+                if (!value.ok) throw new Error(value.error || 'Invalid panel daily-update result.');
+                return value;
+            } catch (error) {
+                const temporary = error.temporaryPanel || error instanceof TypeError || ['TimeoutError', 'AbortError'].includes(error.name);
+                if (!temporary || requestAttempt === 3) throw error;
+                log(`Transient panel request failure ${requestAttempt}/3: ${error.message}; retaining the same run/body.`);
+                await delay(requestAttempt * 5000);
+            }
+        }
     }
     try {
         if (fs.existsSync(statePath)) {

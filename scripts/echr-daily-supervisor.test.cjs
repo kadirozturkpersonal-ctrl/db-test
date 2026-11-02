@@ -77,3 +77,22 @@ test('preflight has no remote calls or child process', async t => {
         fetch: () => { throw Error('no network'); }, runChild: () => { throw Error('no scan'); },
     }), { preflight: true });
 });
+
+test('transient panel failure retries the same frozen run without another browser or roster', async t => {
+    const options = setup(t);
+    const posts = [];
+    let sends = 0;
+    const result = await runDaily({ ...options, sleep: async () => {},
+        runChild: () => { throw Error('periodic recovery must not scrape'); },
+        fetch: async (_url, init) => {
+            if (init.method === 'GET') return { ok: true, json: async () => ({ ok: true, date: options.date, applicationNumbers: ['1/26'], run: { id: 'frozen-run', phase: 'periodic' } }) };
+            posts.push(JSON.parse(init.body));
+            if (posts.length === 1) return { ok: false, status: 500 };
+            sends++;
+            return { ok: true, json: async () => ({ ok: true, run: { id: 'frozen-run', phase: 'completed', status: 'completed' } }) };
+        },
+    });
+    assert.equal(result.completed, true);
+    assert.equal(sends, 1);
+    assert.deepEqual(posts, [{ runId: 'frozen-run' }, { runId: 'frozen-run' }]);
+});

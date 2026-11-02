@@ -43,6 +43,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-echr-local-d
    aynı günlük run devam eder. Yarım kalan gönderim aynı donmuş kapsamı
    kullanır; yeni 25 kişi seçilmez. Kaydedilmiş alıcı hataları otomatik tekrar
    gönderilmez; panelden elle yeniden denenir.
+6. Geçici panel 408/429/5xx veya ağ hatası, aynı istek gövdesi ve aynı günlük
+   kayıtla üç kez denenir. Kimlik/iş kuralı hataları bu yolla aşılmaz.
 
 ## Yerel kanıtlar
 
