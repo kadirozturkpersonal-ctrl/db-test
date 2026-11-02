@@ -104,7 +104,7 @@ async function runDaily(options = {}) {
     if (!release) { log('Another daily supervisor is active; no duplicate was started.'); return { active: true }; }
     const delay = options.sleep || sleep;
     const childRunner = options.runChild || runChild;
-    const deadline = options.deadline || (env.DAILY_SOP_DEADLINE ? Date.parse(env.DAILY_SOP_DEADLINE) : Date.now() + 105 * 60000);
+    const deadline = options.deadline || (env.DAILY_SOP_DEADLINE ? Date.parse(env.DAILY_SOP_DEADLINE) : Date.now() + 225 * 60000);
     if (!Number.isFinite(deadline)) { release(); throw new Error('Invalid daily SOP deadline.'); }
     let phase = 'prepare';
     let attempt = 0;

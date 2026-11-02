@@ -9,7 +9,8 @@ const DEFAULT_MAX_RETRIES = 2;
 // GitHub-hosted runners can need noticeably longer than a local browser before
 // SOP hydrates the result panel. A missing panel is not itself proof that the
 // application is absent from SOP.
-const SOP_RESULT_TIMEOUT_MS = 15000;
+const SOP_RESULT_TIMEOUT_MS = 30000;
+const BROWSER_LAUNCH_TIMEOUT_MS = 60000;
 
 class TemporaryScrapeError extends Error {
 	constructor(message, cause) {
@@ -32,14 +33,28 @@ function sleep(ms) {
  * Create a reusable browser instance.
  * Caller is responsible for calling browser.close() when done.
  */
-async function createBrowser() {
+async function createBrowser(options = {}) {
 	log('🌐 Launching browser (will be reused for all cases)...', true);
-	const executablePath = String(process.env.ECHR_BROWSER_EXECUTABLE_PATH || '').trim();
-	return await chromium.launch({
-		headless: true,
-		...(executablePath ? { executablePath } : {}),
-		timeout: 30000
-	});
+	const env = options.env || process.env;
+	const launch = options.launch || (settings => chromium.launch(settings));
+	const delay = options.sleep || sleep;
+	const executablePath = String(env.ECHR_BROWSER_EXECUTABLE_PATH || '').trim();
+	// Keep the version-matched headless shell independent of desktop Chrome.
+	// An explicit override may be tried first, but cannot block bundled recovery.
+	const targets = executablePath ? [{ executablePath }, {}] : [{}, {}];
+	let lastError;
+	for (let attempt = 0; attempt < targets.length; attempt++) {
+		try {
+			const browser = await launch({ headless: true, ...targets[attempt], timeout: BROWSER_LAUNCH_TIMEOUT_MS });
+			log(`   ✓ Browser ready: ${targets[attempt].executablePath ? 'configured executable' : 'Playwright bundled headless'} (attempt ${attempt + 1})`, true);
+			return browser;
+		} catch (error) {
+			lastError = error;
+			log(`   ⚠️ Browser startup ${attempt + 1}/${targets.length}: ${String(error.message).split('\n')[0]}`, true);
+			if (attempt + 1 < targets.length) await delay(1000);
+		}
+	}
+	throw new TemporaryScrapeError(`Browser startup failed after ${targets.length} bounded attempts: ${lastError.message}`, lastError);
 }
 
 /**
@@ -63,11 +78,13 @@ async function scrapeECHRApplicationOnce(browser, applicationNumber, application
 	try {
 		context = await browser.newContext();
 		const page = await context.newPage();
+		// These resources contain no SOP evidence; keep scripts and styles intact.
+		await page.route('**/*', route => ['image', 'media', 'font'].includes(route.request().resourceType()) ? route.abort() : route.continue());
 
 		// Navigate to the URL
 		await page.goto(url, {
 			waitUntil: 'domcontentloaded',
-			timeout: 15000
+			timeout: 30000
 		});
 
 		// Wait for either a real result or SOP's explicit error panel.  Do not

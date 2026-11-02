@@ -1,7 +1,7 @@
 # Günlük SOP görevi ve kesinti kurtarma
 
 Windows görevi `ECHR Daily SOP Check - 0000`, Türkiye saatiyle 00:00'da
-başlar. 01:57'ye kadar on dakikada bir yeniden tetiklenir; `IgnoreNew` ve
+başlar. 03:57'ye kadar on dakikada bir yeniden tetiklenir; `IgnoreNew` ve
 tek-süreç kilidi aynı anda ikinci tarayıcıyı önler. Görev hatalarında ayrıca
 beş dakika arayla üç yeniden başlatma bulunur. Sadece bu görevi kurmak için:
 
@@ -13,6 +13,20 @@ Eski `ECHR Daily SOP Check - 0007` görevi silinmez; çift çalışmayı önleme
 için devre dışı bırakılır. Geçmiş 00:07 tarama kayıtları panelde korunur.
 
 ## İşleyiş
+
+Tarayıcı, sürümü Playwright ile eşleşen headless Chromium'u kullanır; masaüstü
+Chrome'u zorlanmaz. Başlatma 60 saniye ile sınırlı iki denemeye sahiptir.
+SOP sayfa/sonuç beklemeleri 30 saniyedir. Resim, medya ve font istekleri
+engellenir; sonuç betikleri ve stilleri korunur. Eski 01:57 kesilmesi yerine
+03:57 kurtarma sınırı uygulanır; başlangıç yine 00:00'dır.
+
+Kullanıcının açıkça onayladığı gündüz kurtarması için aşağıdaki komut bugünün
+aynı checkpoint ve günlük run kaydını sürdürür (en fazla 120 dakika ve aynı
+Türkiye günü). Yeni bir 25'li tur açmaz; donmuş periyodik kapsam korunur:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-echr-local-daily-sop.ps1 -RecoverToday
+```
 
 1. Kimlik doğrulamalı panel GET endpointinden o günün SOP havuzu alınır.
    AYM, numarasız dosyalar, nihai SOP ve doğrulanmış HUDOC kararları taranmaz.

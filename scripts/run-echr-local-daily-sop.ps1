@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Preflight)
+param([switch]$Preflight, [switch]$RecoverToday, [ValidateRange(15,240)][int]$RecoveryMinutes = 120)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -26,12 +26,20 @@ foreach ($line in [System.IO.File]::ReadAllLines($panelEnv, [System.Text.Encodin
     }
 }
 $nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') { 'C:\Program Files\nodejs\node.exe' } else { (Get-Command node -ErrorAction Stop).Source }
-if (Test-Path -LiteralPath 'C:\Program Files\Google\Chrome\Application\chrome.exe') {
-    $env:ECHR_BROWSER_EXECUTABLE_PATH = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-}
+# Use Playwright's version-matched headless browser, not auto-updating desktop Chrome.
 $supervisor = Join-Path $PSScriptRoot 'echr-daily-supervisor.cjs'
 if ($Preflight) { & $nodePath $supervisor --preflight; exit $LASTEXITCODE }
-$env:DAILY_SOP_DEADLINE = (Get-Date).Date.AddHours(1).AddMinutes(57).ToString('o')
+$istanbulNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'Turkey Standard Time')
+$nextMidnight = [DateTimeOffset]::new($istanbulNow.Date.AddDays(1), [TimeSpan]::FromHours(3))
+$deadline = [DateTimeOffset]::new($istanbulNow.Date.AddHours(3).AddMinutes(57), [TimeSpan]::FromHours(3))
+if ($RecoverToday) {
+    # Explicit recovery keeps today's checkpoint/run and cannot cross midnight.
+    $deadline = $istanbulNow.AddMinutes($RecoveryMinutes)
+    if ($deadline -gt $nextMidnight) { $deadline = $nextMidnight }
+} elseif ($istanbulNow -ge $deadline) {
+    throw 'Gece suresi doldu. Bugunun ayni kaydini surdurmek icin acikca -RecoverToday kullanin.'
+}
+$env:DAILY_SOP_DEADLINE = $deadline.ToString('o')
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
 $ownsMutex = $false
 try {
