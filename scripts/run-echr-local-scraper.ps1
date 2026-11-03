@@ -101,6 +101,10 @@ while ($Slot -eq '02:00') {
     "[$(Get-Date -Format o)] Waiting for the daily SOP/notification turn before taking its writer lock." | Add-Content -LiteralPath $logPath
     Start-Sleep -Seconds 30
 }
+# Waiting consumes the original calendar-day budget; never carry it past midnight.
+$remainingMinutes = [math]::Floor(($safeStopAt - (Get-Date)).TotalMinutes)
+if ($remainingMinutes -lt 1) { exit 0 }
+$env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
 if (-not $mutex.WaitOne(0)) {
     "[$(Get-Date -Format o)] Another ECHR scraper run is already active; this slot was skipped." | Add-Content -LiteralPath $logPath

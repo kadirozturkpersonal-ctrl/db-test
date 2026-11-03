@@ -40,3 +40,11 @@ test('full scan gives the unfinished daily turn priority before acquiring its wr
     assert.match(source, /dailyState.status -eq 'completed'/);
     assert.match(source, /TimeSpan\]::new\(3,57,0\)/);
 });
+
+test('full scan recalculates its same-day runtime after waiting for the daily turn', () => {
+    const source = fs.readFileSync(require('node:path').join(__dirname, 'run-echr-local-scraper.ps1'), 'utf8');
+    const wait = source.indexOf("while ($Slot -eq '02:00')");
+    const budget = source.lastIndexOf('$env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes');
+    assert.ok(budget > wait && budget < source.indexOf('$mutex = New-Object'));
+    assert.match(source.slice(wait, budget), /\$safeStopAt - \(Get-Date\)/);
+});
