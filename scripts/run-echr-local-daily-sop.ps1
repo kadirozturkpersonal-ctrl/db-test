@@ -27,6 +27,7 @@ foreach ($line in [System.IO.File]::ReadAllLines($panelEnv, [System.Text.Encodin
 }
 $nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') { 'C:\Program Files\nodejs\node.exe' } else { (Get-Command node -ErrorAction Stop).Source }
 # Use Playwright's version-matched headless browser, not auto-updating desktop Chrome.
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $runtimeDir 'playwright-browsers'
 $supervisor = Join-Path $PSScriptRoot 'echr-daily-supervisor.cjs'
 if ($Preflight) { & $nodePath $supervisor --preflight; exit $LASTEXITCODE }
 $istanbulNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'Turkey Standard Time')
@@ -48,6 +49,16 @@ try {
     if (-not $ownsMutex) {
         "[$(Get-Date -Format o)] Browser/D1 writer busy; task must retry, not report success." | Add-Content -LiteralPath $runnerLog -Encoding UTF8
         exit 75
+    }
+    $completed = $false
+    $statePath = Join-Path $runtimeDir 'daily-sop-supervisor-state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        $state = [System.IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+        $completed = $state.date -eq $istanbulNow.ToString('yyyy-MM-dd') -and $state.status -eq 'completed'
+    }
+    if (-not $completed) {
+        & $nodePath (Join-Path $PSScriptRoot 'echr-browser-runtime.cjs')
+        if ($LASTEXITCODE -ne 0) { throw 'Gunluk tarayici saglik kontrolu basarisiz. Tarama/e-posta baslatilmadi.' }
     }
     # The supervisor owns stdout/stderr files; no PowerShell native-output pipeline.
     & $nodePath $supervisor

@@ -88,6 +88,19 @@ if (Test-Path -LiteralPath $systemChrome) {
     $env:ECHR_BROWSER_EXECUTABLE_PATH = $systemChrome
 }
 
+# The 02:00 full scan must not take the writer from an unfinished daily turn.
+# Wait within the existing daily recovery window; completed days proceed at once.
+while ($Slot -eq '02:00') {
+    $dailyNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'Turkey Standard Time')
+    if ($dailyNow.TimeOfDay -ge [TimeSpan]::new(3,57,0)) { break }
+    $dailyStateFile = Join-Path $runtimeDir 'daily-sop-supervisor-state.json'
+    if (Test-Path -LiteralPath $dailyStateFile) {
+        $dailyState = [System.IO.File]::ReadAllText($dailyStateFile) | ConvertFrom-Json
+        if ($dailyState.date -eq $dailyNow.ToString('yyyy-MM-dd') -and $dailyState.status -eq 'completed') { break }
+    }
+    "[$(Get-Date -Format o)] Waiting for the daily SOP/notification turn before taking its writer lock." | Add-Content -LiteralPath $logPath
+    Start-Sleep -Seconds 30
+}
 $mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
 if (-not $mutex.WaitOne(0)) {
     "[$(Get-Date -Format o)] Another ECHR scraper run is already active; this slot was skipped." | Add-Content -LiteralPath $logPath

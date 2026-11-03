@@ -20,6 +20,15 @@ SOP sayfa/sonuç beklemeleri 30 saniyedir. Resim, medya ve font istekleri
 engellenir; sonuç betikleri ve stilleri korunur. Eski 01:57 kesilmesi yerine
 03:57 kurtarma sınırı uygulanır; başlangıç yine 00:00'dır.
 
+Tarayıcılar kullanıcı AppData önbelleği yerine `local-data/playwright-browsers`
+altında tutulur. Her tamamlanmamış günlük çalışmanın başında paket sürümüyle
+eşleşen headless tarayıcı CLI üzerinden kontrol edilir; eksikse kurulur ve
+gerçek bir tarayıcı açılışıyla doğrulanır. Bu adım başarısızsa tarama veya
+e-posta başlamaz. `browser-task-probe.cjs` yalnız güvenli yol/erişim/açılış
+tanılarını kaydeder; gizli ortam değerlerini yazmaz ve SOP sorgusu yapmaz.
+02:00 genel tarama, günlük çalışma tamamlanmadıysa 03:57'ye kadar onun yazma
+kilidine öncelik verir. Böylece günlük kurtarma genel taramanın arkasında kalmaz.
+
 Kullanıcının açıkça onayladığı gündüz kurtarması için aşağıdaki komut bugünün
 aynı checkpoint ve günlük run kaydını sürdürür (en fazla 120 dakika ve aynı
 Türkiye günü). Yeni bir 25'li tur açmaz; donmuş periyodik kapsam korunur:
