@@ -6,12 +6,13 @@ The October invoice charges $214.97 for 214,971,215,844 billable row
 reads and $25 for row writes, plus the $5 November subscription. An invoice
 does not identify the SQL or the database responsible for each row read.
 
-The configured production D1 target still returns its Free daily-row-read
-quota error. Account analytics explicitly returns `not authorized for that
+The configured production D1 target returned its Free daily-row-read
+quota error during the initial investigation. Account analytics explicitly returned `not authorized for that
 account`; a blank `wrangler d1 insights` response is **not** evidence of no
 usage. Historical attribution requires Account Analytics Read access and
-the retained analytics window. No production D1 writes or migration were
-performed during this investigation.
+the retained analytics window. The initial code investigation made no
+production writes; the later explicitly authorized application is recorded
+below.
 
 The panel checkout has unrelated in-progress edits, including its D1 query
 policy and monitor. This change is confined to the separate `db-test` repo
@@ -82,7 +83,7 @@ Once D1 access recovers, inspect `queries` sorted by `rowsRead`, compare
 before/after counts on a bounded workload, and check account analytics for
 other writers/databases. Do not launch a full rescan just to benchmark.
 
-## Prepared production migration - approval required
+## Migration definition and safety procedure
 
 `db-old/migrations/20261106_d1_cost_reduction.sql` makes the expensive
 representative-count trigger run only when a case changes representative,
@@ -96,6 +97,44 @@ the live trigger/index definitions, then apply only if they match the
 expected schema. The local snapshot is historical, not a current backup.
 Verify a small authorized write workload and compare its returned row counts.
 The new migration is deliberately **not** executed by scheduled workflows.
+
+## Authorized production application - 2026-11-06
+
+The user explicitly authorized a current backup, application of this schema
+migration, and verification. Workers Paid restored D1 access first.
+
+- Full SQL export completed at 16:07 UTC (19:07 Istanbul), 308,505,393 bytes.
+- SHA-256: `ad071fbb30cdbf566aa852f17b4972ce43f71a1be4806878c6cba8f4f002d7e5`.
+- The export was restored to a separate local SQLite file: integrity `ok`,
+  zero foreign-key violations, 13 user tables. The first slow autocommit
+  verification was stopped and its partial file retained; the verified file
+  uses a single local restore transaction.
+- Backup files and operation receipts are under the panel's ignored
+  `local-data/backups/d1/20261106T160700Z/`, separate from Git/code sync.
+- Pre-change Time Travel bookmark:
+  `00002e9e-00000000-0000511b-d87a4ae2df3e357bbd253b08ca08dede`.
+- Live counts and the old trigger matched the verified backup before writing.
+- Migration applied and verified at 16:13 UTC (19:13 Istanbul). The covering
+  index `idx_sop_no_info_status_date_number` is selected for the pending/date
+  predicate, and the update trigger has its representative-change guard.
+- A bounded no-op UPDATE read 2 rows and wrote 3 physical rows (the case and
+  indexes); case fields and representative counters/timestamp stayed equal.
+  It did not send notifications or run a scraper.
+- All 13 table counts remained unchanged. Core counts: 311,176 applications,
+  477,273 events, 46,588 representatives, 179,310 no-info candidates.
+- Reassignment to another representative was checked only on an in-memory
+  copy of the restored backup; both old and new counts were correct.
+
+The initial count preflight used too many UNION terms for D1 and failed
+before any mutation. It was replaced with one SELECT of scalar counts.
+The successful local operation receipt is `migration-receipt.42548.json`.
+
+The local panel still held its earlier quota circuit in memory after the
+upgrade. Only the confirmed canonical Next.js server was restarted through
+the hidden launcher. A fresh `/aihm-veritabani` response returned HTTP 200,
+used the live Cloudflare D1 published source, and contained neither the quota
+error nor the local SQLite fallback. The separate analysis worker was not
+restarted.
 
 References:
 - https://developers.cloudflare.com/d1/platform/pricing/
