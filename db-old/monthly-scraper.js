@@ -532,6 +532,10 @@ class MonthlyECHRScraper {
 	requestPublishedSnapshotRefresh() {
 		const url = String(process.env.ECHR_PUBLISHED_SNAPSHOT_REFRESH_URL || '').trim();
 		if (!url || typeof fetch !== 'function') return;
+		// A full snapshot scans the entire database, not a per-25-case operation.
+		if (this.lastPublishedSnapshotRequest && Date.now() - this.lastPublishedSnapshotRequest < 24 * 60 * 60 * 1000) return;
+		if (!this.stats.d1Saved) return;
+		this.lastPublishedSnapshotRequest = Date.now();
 		void fetch(url, { method: 'POST' }).catch((error) => {
 			log(`   ⚠️ Published panel summary refresh could not start: ${error.message}`, true);
 		});
@@ -820,12 +824,32 @@ class MonthlyECHRScraper {
 		}
 	}
 
+	persistLocalTelemetry(status = this.localTerminalStatus || 'running') {
+		if (this.runSource !== 'local-windows-task' || !this.activityFile) return;
+		try {
+			const file = path.join(path.dirname(this.activityFile), 'echr-scraper-runs.json');
+			const saved = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : { runs: [] };
+			const phaseSummaries = {};
+			for (const phase of this.phaseTelemetry.keys()) {
+				const m = this.getPhaseTelemetry(phase);
+				phaseSummaries[phase] = { phase, startedAt: m.startedAt, completedAt: m.completedAt, firstApplicationNumber: m.firstApplicationNumber, lastApplicationNumber: m.currentApplicationNumber, processedCount: m.processed, checkedPerMinute: m.checkedPerMinute, newApplicationsAdded: m.newApplicationsAdded, applicationsSaved: m.applicationsSaved, errorCount: m.errorCount };
+			}
+			const current = this.getPhaseTelemetry();
+			const row = { id: this.runId, cycleId: this.logicalCycleId, scheduleSlot: this.scheduleSlot, runSource: this.runSource, runMode: 'historical-cycle', status, startedAt: this.runStartedAt, completedAt: status === 'running' ? null : new Date().toISOString(), newApplicationsAdded: current.newApplicationsAdded, applicationsSaved: current.applicationsSaved, errorCount: current.errorCount, currentApplicationNumber: current.currentApplicationNumber, firstApplicationNumber: current.firstApplicationNumber, currentPhase: this.currentPhase, processedCount: current.processed, checkedPerMinute: current.checkedPerMinute, lastHeartbeatAt: new Date().toISOString(), phaseSummaries };
+			const runs = [row, ...saved.runs.filter(r => r.id !== this.runId)].slice(0, 200);
+			const temp = `${file}.${process.pid}.tmp`;
+			fs.writeFileSync(temp, JSON.stringify({ pid: process.pid, runs }));
+			fs.renameSync(temp, file);
+		} catch (error) { log(`Local telemetry could not be saved: ${error.message}`, true); }
+	}
+
 	async completePhaseTelemetry(phase = this.currentPhase) {
 		const telemetry = this.phaseTelemetry.get(phase);
 		if (!telemetry || telemetry.completedAt) return;
 		const completedAt = new Date().toISOString();
 		telemetry.completedAt = completedAt;
 		const summary = this.getPhaseTelemetry(phase);
+		this.persistLocalTelemetry();
 		await this.d1.querySQL(
 			`INSERT INTO echr_scraper_phase_summaries (
 				run_id, phase, started_at, completed_at, first_application_number, last_application_number,
@@ -881,6 +905,7 @@ class MonthlyECHRScraper {
 
 	queueProgressUpdate() {
 		const metrics = this.getPhaseTelemetry();
+		this.persistLocalTelemetry();
 		const now = new Date().toISOString();
 		this.progressUpdatePromise = this.progressUpdatePromise
 			.catch(() => undefined)
@@ -911,6 +936,8 @@ class MonthlyECHRScraper {
 
 	async finishScrapeRun(error = null) {
 		const message = error ? String(error.message || error).slice(0, 2000) : null;
+		this.localTerminalStatus = message || this.state?.lastReason === 'temporary-source-error' ? 'failed' : 'completed';
+		this.persistLocalTelemetry();
 		await this.progressUpdatePromise;
 		await this.completePhaseTelemetry();
 		await this.d1.querySQL(
