@@ -1,7 +1,10 @@
 const { execSync } = require('child_process');
 const { log } = require('./debug');
-const { D1ImportAPI } = require('./d1-import-api');
+const path = require('node:path');
 const { maskDatabaseId, verifyConfiguredD1Target } = require('./d1-target');
+const { D1CostTracker } = require('./d1-cost-tracker');
+const { isD1StopError } = require('./d1-runtime-errors');
+const quotaBlocks = new Map();
 
 // D1's DATE('now') is UTC. More importantly, the Import API de-duplicates an
 // identical SQL payload by its hash. A dynamic DATE('now', ...) expression
@@ -25,7 +28,7 @@ function getIstanbulBusinessDate(date = new Date()) {
 const ISTANBUL_SQL_DATE = `'${getIstanbulBusinessDate()}'`;
 
 /**
- * Adapter to save scraped data to Cloudflare D1 using Wrangler CLI
+ * Measured REST adapter for small scraper packages.
  */
 class D1Adapter {
     constructor(databaseName = 'echr-db') {
@@ -39,22 +42,11 @@ class D1Adapter {
         this.cacheCounter = 0;
         this.CACHE_FLUSH_INTERVAL = 10; // Flush cache every 10 cases
         this.sopNoInfoTrackingReady = false;
-
-        // Initialize D1 Import API if credentials available
-        const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
-        const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-        const databaseId = this.databaseId;
-
-        if (accountId && apiToken) {
-            this.importAPI = new D1ImportAPI(accountId, databaseId, apiToken);
-            log('✅ D1 Import API initialized (fast mode enabled)', true);
-        } else {
-            this.importAPI = null;
-            log('⚠️  D1 Import API not available - using Wrangler CLI (slower)', true);
-        }
+        this.costTracker = new D1CostTracker();
+        this.costReportFile = process.env.D1_COST_REPORT_FILE || path.resolve(__dirname, '../local-data/d1-query-costs.json');
     }
 
-    async fetchWithRetry(url, options, label, maxAttempts = 3) {
+    async fetchWithRetry(url, options, label, maxAttempts = 3, onRetry = () => {}) {
         let lastError;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -76,6 +68,7 @@ class D1Adapter {
             }
 
             const delayMs = attempt * 1000;
+            onRetry();
             log(`   ⚠️  ${label} temporarily failed (${lastError.message}); retrying in ${delayMs}ms.`, true);
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
@@ -90,6 +83,8 @@ class D1Adapter {
         const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
         const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 
+        const block = quotaBlocks.get(accountId);
+        if (block && block.until > Date.now()) throw block.error;
         if (!accountId || !apiToken) {
             const result = this.executeSQL(sql);
             const rows = [];
@@ -105,7 +100,9 @@ class D1Adapter {
             return rows;
         }
 
-        const response = await this.fetchWithRetry(
+        const readOnly = /^\s*(SELECT|EXPLAIN|PRAGMA)\b/i.test(sql);
+        let response;
+        try { response = await this.fetchWithRetry(
             `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/d1/database/${encodeURIComponent(this.databaseId)}/query`,
             {
                 method: 'POST',
@@ -114,17 +111,34 @@ class D1Adapter {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({ sql, params })
-            }
-        );
+            },
+            'D1 SQL',
+            readOnly ? 3 : 1,
+            () => this.costTracker.record(sql, [])
+        ); } catch (error) {
+            this.costTracker.record(sql, []);
+            try { this.costTracker.save(this.costReportFile); } catch { /* Never replay a write because telemetry failed. */ }
+            error.code = readOnly ? 'D1_READ_FAILED' : 'D1_WRITE_FAILED';
+            throw error;
+        }
         const payload = await response.json().catch(() => null);
+        this.costTracker.record(sql, payload?.result || []);
+        try { this.costTracker.save(this.costReportFile); }
+        catch (error) { log(`D1 cost report could not be saved: ${error.code || 'IO_ERROR'}`, true); }
         const apiErrors = payload?.errors?.map(error => error.message).filter(Boolean);
 
         if (!response.ok || payload?.success === false) {
-            throw new Error(apiErrors?.join('; ') || `Cloudflare D1 HTTP ${response.status}`);
+            const error = new Error(apiErrors?.join('; ') || `Cloudflare D1 HTTP ${response.status}`);
+            if (isD1StopError(error)) {
+                error.code = 'D1_QUOTA_EXCEEDED';
+                const now = new Date();
+                quotaBlocks.set(accountId, { error, until: Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1) });
+            } else error.code = 'D1_SQL_FAILED';
+            throw error;
         }
 
         const failedResult = payload?.result?.find(result => result.success === false);
-        if (failedResult) throw new Error(failedResult.error || 'Cloudflare D1 query failed');
+        if (failedResult) throw Object.assign(new Error(failedResult.error || 'Cloudflare D1 query failed'), { code: 'D1_SQL_FAILED' });
         const firstResult = payload?.result?.[0];
         if (!firstResult) {
             return [];
@@ -274,23 +288,24 @@ class D1Adapter {
                 administrative_rejection_date = COALESCE(administrative_rejection_date, DATE('now')),
                 updated_at = CURRENT_TIMESTAMP
             WHERE status = 'pending'
-              AND DATE(first_not_found_date, '+${days} days') <= DATE('now')
+              AND first_not_found_date <= DATE('now', '-${days} days')
         `);
     }
 
     async loadKnownApplicationNumbers() {
         const known = new Set();
         const limit = 10000;
-        let offset = 0;
+        let afterId = 0;
 
         for (;;) {
             const rows = await this.querySQL(`
-                SELECT application_number
+                SELECT id, application_number
                 FROM applications
-                WHERE application_number IS NOT NULL
+                WHERE id > ${afterId}
+                  AND application_number IS NOT NULL
                   AND TRIM(application_number) <> ''
                 ORDER BY id ASC
-                LIMIT ${limit} OFFSET ${offset}
+                LIMIT ${limit}
             `);
 
             for (const row of rows) {
@@ -303,7 +318,7 @@ class D1Adapter {
                 break;
             }
 
-            offset += limit;
+            afterId = rows[rows.length - 1].id;
         }
 
         return known;
@@ -313,15 +328,16 @@ class D1Adapter {
         await this.ensureSOPNoInfoTracking();
         const rejected = new Set();
         const limit = 10000;
-        let offset = 0;
+        let afterNumber = '';
 
         for (;;) {
             const rows = await this.querySQL(`
                 SELECT application_number
                 FROM sop_no_info_tracking
                 WHERE status = 'administrative_rejection'
+                  AND application_number > '${this.escapeSQL(afterNumber)}'
                 ORDER BY application_number ASC
-                LIMIT ${limit} OFFSET ${offset}
+                LIMIT ${limit}
             `);
 
             for (const row of rows) {
@@ -334,7 +350,7 @@ class D1Adapter {
                 break;
             }
 
-            offset += limit;
+            afterNumber = rows[rows.length - 1].application_number;
         }
 
         return rejected;
@@ -434,6 +450,7 @@ class D1Adapter {
             log(`   📝 No-info tracking saved: ${uniqueNumbers.length}`, true);
             return { success: uniqueNumbers.length, failed: 0, administrativeRejected };
         } catch (error) {
+            if (isD1StopError(error)) throw error;
             log(`   ⚠️  Failed to save no-info tracking: ${error.message}`, true);
             return { success: 0, failed: applicationNumbers.length, administrativeRejected: [] };
         }
@@ -454,16 +471,17 @@ class D1Adapter {
         ];
         const finalized = new Set();
         const limit = 10000;
-        let offset = 0;
+        let afterId = 0;
         const escapeSQL = (str) => str.replace(/'/g, "''");
         const finalEventValues = finalEvents.map(event => `'${escapeSQL(event)}'`).join(', ');
 
         for (;;) {
             const rows = await this.querySQL(
                 `
-                    SELECT application_number
+                    SELECT id, application_number
                     FROM applications
-                    WHERE application_number IS NOT NULL
+                    WHERE id > ${afterId}
+                      AND application_number IS NOT NULL
                       AND TRIM(application_number) <> ''
                       AND (
                           is_closed = 1
@@ -471,7 +489,7 @@ class D1Adapter {
                           OR LOWER(last_major_event) LIKE 'decision to strike a case out of the list%'
                       )
                     ORDER BY id ASC
-                    LIMIT ${limit} OFFSET ${offset}
+                    LIMIT ${limit}
                 `
             );
 
@@ -485,7 +503,7 @@ class D1Adapter {
                 break;
             }
 
-            offset += limit;
+            afterId = rows[rows.length - 1].id;
         }
 
         return finalized;
@@ -641,113 +659,14 @@ class D1Adapter {
      */
     async saveApplication(data) {
         try {
-            data = this.normalizeApplicationData(data);
-            log(`\n💾 Saving to D1: ${data.applicationNumber}`);
-
-            // 1. Find or create representative (if exists)
-            let representativeId = null;
-
-            if (data.representant && data.representant.trim()) {
-                representativeId = await this.findOrCreateRepresentative(data.representant);
-            } else {
-                log('   ℹ️  No representative provided');
-            }
-
-            // 2. Convert dates
-            const dateIntroduction = this.convertDate(data.dateIntroduction);
-            const lastMajorEventDate = this.convertDate(data.lastMajorEventDate);
-            const country = this.extractCountry(data.applicationTitle);
-            const isClosed = this.isCaseClosed(data.lastMajorEvent);
-            if (isClosed) {
-                log(`   🔒 Case will be marked as CLOSED`, true);
-            }
-
-            log(`   🌍 Country: ${country}`);
-            log(`   📅 Date intro: ${dateIntroduction}`);
-            log(`   📆 Last event: ${lastMajorEventDate}`);
-
-            // 3. Escape single quotes in text fields
-            const escapeSQL = (str) => str ? str.replace(/'/g, "''") : null;
-
-            // 4. Insert/Update application
-            const appSQL = `
-                INSERT INTO applications (
-                    application_number, application_title, country, date_introduction,
-                    representative_id, representative_name, last_major_event, last_major_event_date,
-                    is_closed, last_checked_date
-                ) VALUES (
-                    '${data.applicationNumber}',
-                    '${escapeSQL(data.applicationTitle)}',
-                    ${country ? `'${escapeSQL(country)}'` : 'NULL'},
-                    ${dateIntroduction ? `'${dateIntroduction}'` : 'NULL'},
-                    ${representativeId || 'NULL'},
-                    ${data.representant ? `'${escapeSQL(data.representant)}'` : 'NULL'},
-                    ${data.lastMajorEvent ? `'${escapeSQL(data.lastMajorEvent)}'` : 'NULL'},
-                    ${lastMajorEventDate ? `'${lastMajorEventDate}'` : 'NULL'},
-                    ${isClosed ? 1 : 0},
-                    ${ISTANBUL_SQL_DATE}
-                )
-                ON CONFLICT(application_number) DO UPDATE SET
-                    application_title = excluded.application_title,
-                    country = excluded.country,
-                    date_introduction = excluded.date_introduction,
-                    representative_id = excluded.representative_id,
-                    representative_name = excluded.representative_name,
-                    last_major_event = excluded.last_major_event,
-                    last_major_event_date = excluded.last_major_event_date,
-                    is_closed = excluded.is_closed,
-                    last_checked_date = ${ISTANBUL_SQL_DATE},
-                    not_found_count = 0,
-                    updated_at = CURRENT_TIMESTAMP
-            `;
-
-            log('   🔧 Saving application...');
-            this.executeSQL(appSQL);
-            log('   ✅ Application saved!');
-
-            // 5. Get application ID (needed for events)
-            const getAppIdSQL = `SELECT id FROM applications WHERE application_number = '${data.applicationNumber}'`;
-            const appIdResult = this.executeSQL(getAppIdSQL);
-            const appIdMatch = appIdResult.match(/"id":\s*(\d+)/);
-
-            if (!appIdMatch) {
-                throw new Error('Failed to get application ID');
-            }
-
-            const applicationId = parseInt(appIdMatch[1]);
-
-            // 6. Delete old events + Insert all new events in ONE big query
-            log(`   📋 Saving ${data.majorEventsList.length} events...`, true);
-
-            let eventsSQL = `DELETE FROM events WHERE application_id = ${applicationId};`;
-            if (data.majorEventsList.length > 0) {
-                const eventValues = data.majorEventsList.map((event, i) => {
-                    const eventDate = this.convertDate(event.eventDate);
-                    const isLastEvent = (i === data.majorEventsList.length - 1) ? 1 : 0;
-                    return `(${applicationId}, '${eventDate}', '${escapeSQL(event.description)}', ${isLastEvent})`;
-                }).join(',\n                ');
-
-                eventsSQL += `
-                    INSERT INTO events (application_id, event_date, description, is_last_event)
-                    VALUES ${eventValues}
-                `;
-            }
-
-            this.executeSQL(eventsSQL);
-            await this.clearSOPNoInfoCandidates([data.applicationNumber]);
-            log('   🎉 Complete!\n', true);
-
-            // Flush cache if needed (every 10 cases)
-            this.flushCacheIfNeeded();
-
-            return true;
-
+            const result = await this.saveBatch([data]);
+            return result.success === 1 && result.failed === 0;
         } catch (error) {
+            if (isD1StopError(error)) throw error;
             log(`   ❌ Failed to save: ${error.message}`, true);
             return false;
         }
     }
-
     /**
      * Build SQL for batch import (multiple cases at once)
      */
@@ -855,39 +774,57 @@ class D1Adapter {
             log(`   ⚠️  Invalid cases skipped before D1 write: ${validation.failed}`, true);
         }
 
-        // Use Import API (fast!)
-        if (this.importAPI) {
-            try {
-                // Build complete SQL with representatives included
-                const batchSQL = this.buildBatchSQLWithReps(validCases);
-
-                // Upload via Import API - ONE CALL DOES EVERYTHING!
-                await this.importAPI.uploadSQL(batchSQL);
-
-                log(`   ✅ Batch complete: ${validCases.length} cases saved via Import API!`, true);
-
-                return { success: validCases.length, failed: validation.failed };
-            } catch (error) {
-                log(`   ❌ Batch import failed: ${error.message}`, true);
-                log('   🔄 Falling back to individual saves...', true);
-                // Fall through to individual saves as backup
-            }
+        // Small, recoverable REST batches expose actual rows_read/rows_written.
+        // Do not replay an uncertain bulk import through a second write path.
+        for (let offset = 0; offset < validCases.length; offset += 25) {
+            const chunk = validCases.slice(offset, offset + 25);
+            const unchangedEvents = await this.findUnchangedEvents(chunk);
+            // A normal 25-case package is below D1's 100 KB SQL ceiling. Split
+            // larger packages before sending anything from that package.
+            await this.writeMeasuredBatch(chunk, unchangedEvents);
         }
+        return { success: validCases.length, failed: validation.failed };
+    }
 
-        // Fallback: Save individually (slower but reliable)
-        let successCount = 0;
-        let failCount = validation.failed;
-
-        for (const data of validCases) {
-            const saved = await this.saveApplication(data);
-            if (saved) {
-                successCount++;
+    async findUnchangedEvents(casesData) {
+        const numbers = [...new Set(casesData.map(data => data.applicationNumber))];
+        const rows = await this.querySQL(`
+            SELECT a.application_number, e.event_date, e.description, e.is_last_event
+            FROM applications a JOIN events e ON e.application_id = a.id
+            WHERE a.application_number IN (${numbers.map(() => '?').join(',')})
+            ORDER BY a.id, e.id
+        `, numbers);
+        const byNumber = new Map(numbers.map(number => [number, []]));
+        for (const row of rows) byNumber.get(row.application_number)?.push([
+            row.event_date, row.description, Number(row.is_last_event) || 0
+        ]);
+        const unchanged = new Set();
+        const changed = new Set();
+        for (const data of casesData) {
+            const next = data.majorEventsList.map((event, index) => [
+                this.convertDate(event.eventDate), event.description,
+                index === data.majorEventsList.length - 1 ? 1 : 0
+            ]);
+            if (!changed.has(data.applicationNumber) && JSON.stringify(byNumber.get(data.applicationNumber)) === JSON.stringify(next)) {
+                unchanged.add(data.applicationNumber);
             } else {
-                failCount++;
+                unchanged.delete(data.applicationNumber);
+                changed.add(data.applicationNumber);
             }
         }
+        return unchanged;
+    }
 
-        return { success: successCount, failed: failCount };
+    async writeMeasuredBatch(casesData, unchangedEvents) {
+        const sql = this.buildBatchSQLWithReps(casesData, { unchangedEvents });
+        if (Buffer.byteLength(sql, 'utf8') <= 90_000) {
+            await this.querySQL(sql);
+            return;
+        }
+        if (casesData.length === 1) throw new Error('D1 case package exceeds the safe SQL size limit; no fallback replay was attempted.');
+        const middle = Math.ceil(casesData.length / 2);
+        await this.writeMeasuredBatch(casesData.slice(0, middle), unchangedEvents);
+        await this.writeMeasuredBatch(casesData.slice(middle), unchangedEvents);
     }
 
     // A daily check saves one small record, not a bulk database import. Keep
@@ -895,14 +832,13 @@ class D1Adapter {
     // Wrangler subprocess, or fallback that can outlive the scheduled task.
     async saveDailyApplication(data) {
         const normalized = this.normalizeApplicationData(data);
-        await this.querySQL(this.buildBatchSQLWithReps([normalized]));
-        return { success: 1, failed: 0 };
+        return this.saveBatch([normalized]);
     }
 
     /**
      * Build SQL for batch import INCLUDING representative handling
      */
-    buildBatchSQLWithReps(casesData) {
+    buildBatchSQLWithReps(casesData, { unchangedEvents = new Set() } = {}) {
         casesData = this.validateApplications(casesData).valid;
 
         const sqlStatements = [];
@@ -916,14 +852,12 @@ class D1Adapter {
         if (uniqueReps.length > 0) {
             log(`   👥 Including ${uniqueReps.length} unique representatives in batch...`, true);
 
-            // INSERT OR IGNORE creates only if doesn't exist
-            const repValues = uniqueReps
-                .map(name => `('${escapeSQL(name)}')`)
-                .join(',\n        ');
-
-            sqlStatements.push(
-                `INSERT OR IGNORE INTO representatives (name) VALUES\n        ${repValues};`
-            );
+            // Avoid even attempting an AUTOINCREMENT insert for known names.
+            for (const name of uniqueReps) {
+                sqlStatements.push(`INSERT OR IGNORE INTO representatives (name)
+                    SELECT '${escapeSQL(name)}'
+                    WHERE NOT EXISTS (SELECT 1 FROM representatives WHERE name = '${escapeSQL(name)}');`);
+            }
         }
 
         // 2. Build all application INSERTS/UPDATES
@@ -974,7 +908,19 @@ class D1Adapter {
                         is_closed = excluded.is_closed,
                         last_checked_date = ${ISTANBUL_SQL_DATE},
                         not_found_count = 0,
-                        updated_at = CURRENT_TIMESTAMP;`);
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE applications.application_title IS NOT excluded.application_title
+                       OR applications.country IS NOT excluded.country
+                       OR applications.date_introduction IS NOT excluded.date_introduction
+                       OR applications.representative_id IS NOT excluded.representative_id
+                       OR applications.representative_name IS NOT excluded.representative_name
+                       OR applications.last_major_event IS NOT excluded.last_major_event
+                       OR applications.last_major_event_date IS NOT excluded.last_major_event_date
+                       OR applications.is_closed IS NOT excluded.is_closed
+                       OR applications.last_checked_date IS NOT excluded.last_checked_date
+                       OR COALESCE(applications.not_found_count, 0) <> 0;`);
+
+                if (unchangedEvents.has(data.applicationNumber)) continue;
 
                 // Delete old events for this case
                 eventStatements.push(

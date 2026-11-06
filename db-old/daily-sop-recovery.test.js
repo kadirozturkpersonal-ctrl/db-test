@@ -88,6 +88,8 @@ test('completed checkpoint is restricted to the current pool and business day', 
 test('daily writes never call bulk import or legacy shell fallbacks', async () => {
     const adapter = Object.create(D1Adapter.prototype);
     adapter.normalizeApplicationData = data => data;
+    adapter.validateApplications = rows => ({ valid: rows, failed: 0 });
+    adapter.findUnchangedEvents = async () => new Set();
     adapter.buildBatchSQLWithReps = () => 'INSERT INTO applications VALUES (1); UPDATE applications SET id=1;';
     adapter.importAPI = { uploadSQL: () => { throw Error('bulk import prohibited'); } };
     adapter.executeSQL = () => { throw Error('shell prohibited'); };

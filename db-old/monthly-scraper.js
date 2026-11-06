@@ -85,6 +85,7 @@ const {
 	TemporaryScrapeError
 } = require('./improved-scraper');
 const { D1Adapter } = require('./d1-adapter');
+const { isD1StopError } = require('./d1-runtime-errors');
 const { log } = require('./debug');
 
 /**
@@ -150,6 +151,7 @@ class MonthlyECHRScraper {
 		// applications because empty/known application numbers are checkpoints too.
 		this.BATCH_ATTEMPTS = 25;
 		this.batchQueue = []; // Cases waiting to be written
+		this.batchCheckpoint = null;
 		this.noInfoQueue = []; // Unknown cases that returned no SOP information
 		this.attemptCounter = 0; // Count scrape attempts
 
@@ -246,7 +248,7 @@ class MonthlyECHRScraper {
 		}
 
 		const nextState = {
-			...this.state,
+			...(this.batchCheckpoint || this.state),
 			version: STATE_VERSION,
 			cycleStartYear: START_YEAR,
 			cycleEndYear: this.cycleEndYear,
@@ -259,7 +261,7 @@ class MonthlyECHRScraper {
 		const tempFile = `${this.stateFile}.tmp`;
 		fs.writeFileSync(tempFile, `${JSON.stringify(nextState, null, 2)}\n`);
 		fs.renameSync(tempFile, this.stateFile);
-		this.state = nextState;
+		this.state = { ...this.state, updatedAt: nextState.updatedAt, lastReason: reason };
 		log(`   💾 State saved (${reason}): ${this.state.currentNumber}/${this.toECHRYear(this.state.currentYear)} | empty ${this.state.consecutiveEmpty}`, true);
 	}
 
@@ -369,6 +371,7 @@ class MonthlyECHRScraper {
 			this.finalizedApplicationNumbers = await this.d1.loadFinalizedApplicationNumbers();
 			log(`   🧭 Finalized applications loaded for skip: ${this.finalizedApplicationNumbers.size}`, true);
 		} catch (error) {
+			if (isD1StopError(error)) throw error;
 			this.finalizedApplicationNumbers = new Set();
 			log(`   ⚠️  Finalized skip list could not be loaded: ${error.message}`, true);
 			log('   Continuing without finalized-case skips for this run.', true);
@@ -393,6 +396,7 @@ class MonthlyECHRScraper {
 			log(`   🚫 Administrative rejections loaded for skip: ${this.administrativelyRejectedApplicationNumbers.size}`, true);
 			log(`   ⏳ Administrative rejection grace period: ${this.administrativeRejectionGraceDays} days`, true);
 		} catch (error) {
+			if (isD1StopError(error)) throw error;
 			this.knownApplicationNumbers = new Set();
 			this.administrativelyRejectedApplicationNumbers = new Set();
 			this.administrativeRejectionTrackingEnabled = false;
@@ -460,6 +464,7 @@ class MonthlyECHRScraper {
 	 */
 	async flushBatch() {
 		if (this.batchQueue.length === 0 && this.noInfoQueue.length === 0) {
+			this.batchCheckpoint = null;
 			log('\n   ℹ️  No cases to write in this batch', true);
 			return;
 		}
@@ -515,6 +520,7 @@ class MonthlyECHRScraper {
 
 		// Clear the queue and reset counter
 		this.batchQueue = [];
+		this.batchCheckpoint = null;
 		this.attemptCounter = 0;
 		this.stats.flushes++;
 		this.stats.totalD1WriteMs += Date.now() - flushStartedAt;
@@ -1010,6 +1016,7 @@ class MonthlyECHRScraper {
 				}
 				currentNumber += direction;
 			} catch (error) {
+				if (isD1StopError(error)) throw error;
 				technicalErrorCount++;
 				this.stats.errors++;
 				const message = String(error.message || error).slice(0, 2000);
@@ -1142,6 +1149,7 @@ class MonthlyECHRScraper {
 
 					try {
 						// Increment attempt counter
+						this.batchCheckpoint ||= { ...this.state };
 						this.attemptCounter++;
 
 						// Scrape the case (reusing the shared browser)
@@ -1186,6 +1194,7 @@ class MonthlyECHRScraper {
 						}
 
 					} catch (error) {
+						if (isD1StopError(error)) throw error;
 						log(`   ❌ Error: ${error.message}`, true);
 						this.stats.errors++;
 						this.recordActivity('technical_error', { applicationNumber, message: String(error.message || error) });
@@ -1244,11 +1253,13 @@ class MonthlyECHRScraper {
 		} catch (error) {
 			runError = error;
 			try {
-				await this.flushBatch();
+				if (!isD1StopError(error)) await this.flushBatch();
 			} catch (flushError) {
 				log(`   ⚠️  Could not flush after fatal error: ${flushError.message}`, true);
 			}
 			try {
+				if (this.batchCheckpoint) this.state = { ...this.batchCheckpoint };
+				this.batchCheckpoint = null;
 				this.saveState('fatal-error');
 			} catch (stateError) {
 				log(`   ⚠️  Could not save checkpoint after fatal error: ${stateError.message}`, true);

@@ -32,7 +32,16 @@ jobs:
           HUMAN_RIGHTS_DAILY_UPDATE_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
           HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
           DATABASE_NAME: echr-db
+          D1_COST_REPORT_FILE: ${{ github.workspace }}/local-data/d1-daily-query-costs.json
         run: node scripts/echr-daily-supervisor.cjs
+      - name: Preserve measured D1 query costs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-daily-query-costs-${{ github.run_id }}
+          path: local-data/d1-daily-query-costs.*.json
+          if-no-files-found: ignore
+          retention-days: 31
       - name: Preserve failure evidence without environment secrets
         if: failure()
         uses: actions/upload-artifact@v4

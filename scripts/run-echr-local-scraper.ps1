@@ -67,6 +67,7 @@ $env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else 
 $env:CURRENT_YEAR_PRIORITY_END_HOUR = [string]$CurrentYearPriorityEndHour
 $env:SCRAPER_REQUEST_DELAY_MS = '1350'
 $env:MAX_CONSECUTIVE_EMPTY = '500'
+$env:D1_COST_REPORT_FILE = Join-Path $runtimeDir 'd1-monthly-query-costs.json'
 # One continuous daytime run is intentionally used instead of three separate
 # runs.  Keep a 15-minute margin before midnight so the scraper can checkpoint
 # and exit cleanly.  If Task Scheduler starts the task late (for example after

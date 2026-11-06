@@ -63,6 +63,7 @@ jobs:
           BROWSER_MAX_UPTIME_MINUTES: '90'
           SCRAPER_STATE_FILE: './scraper-state.json'
           SCRAPER_FAILURE_REPORT_FILE: './scraper-failure.json'
+          D1_COST_REPORT_FILE: './d1-cost-report.json'
           # Ortak D1 çalışma geçmişinde GitHub koşularını yereldeki tarayıcıdan
           # ayırır; yalnız yeni kayıtlar etiketlenir, mevcut kayıtlar değişmez.
           SCRAPER_RUN_SOURCE: 'github-actions'
@@ -157,28 +158,15 @@ jobs:
 
       - name: Persist scraper checkpoint
         if: always()
-        run: |
-          set -u
-          if [ -n "$(git status --porcelain -- db-old/scraper-state.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add db-old/scraper-state.json
-            if ! git commit -m "chore: update ECHR scraper checkpoint [skip ci]"; then
-              echo "::warning::Checkpoint commit could not be created. D1 writes are already durable; the next run may repeat a small range safely."
-              exit 0
-            fi
-            for attempt in 1 2 3; do
-              if git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME"; then
-                exit 0
-              fi
-              echo "::warning::Checkpoint push attempt $attempt failed; retrying shortly."
-              sleep $((attempt * 5))
-            done
-            echo "::warning::Checkpoint could not be pushed. D1 writes are already durable; the next run may repeat a small range safely."
-            exit 0
-          else
-            echo "No checkpoint changes to persist."
-          fi
+        run: node scripts/persist-scraper-checkpoint.cjs
+
+      - name: Preserve recoverable scraper checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-checkpoint-${{ github.run_id }}
+          path: db-old/scraper-state.json
+          retention-days: 31
 
       - name: Upload scraper failure report
         if: failure()
@@ -188,3 +176,12 @@ jobs:
           path: db-old/scraper-failure.json
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Preserve measured D1 query costs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-query-costs-${{ github.run_id }}
+          path: db-old/d1-cost-report.*.json
+          if-no-files-found: ignore
+          retention-days: 31

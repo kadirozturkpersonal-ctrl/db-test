@@ -15,6 +15,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
 const { D1Adapter, ISTANBUL_SQL_DATE } = require('./d1-adapter');
+const { isD1StopError } = require('./d1-runtime-errors');
 const { log } = require('./debug');
 const { writeJsonAtomic, readCheckpoint } = require('./daily-sop-checkpoint');
 
@@ -323,6 +324,7 @@ class WeeklyECHRScraper {
 					}
 
 				} catch (error) {
+					if (isD1StopError(error)) throw error;
 					log(`   ❌ Error: ${error.message}`, true);
 					this.stats.errors++;
 					this.recordActivity('technical_error', {
