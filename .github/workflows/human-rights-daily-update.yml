@@ -12,6 +12,8 @@ concurrency:
 
 jobs:
   scrape-and-notify:
+    # Local Windows tasks exclusively own the daily scan/notification queue.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 210
     steps:
