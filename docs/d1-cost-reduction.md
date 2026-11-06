@@ -17,6 +17,12 @@ The panel checkout has unrelated in-progress edits, including its D1 query
 policy and monitor. This change is confined to the separate `db-test` repo
 and does not replace or commit those panel edits.
 
+During integration, upstream commit `91cb953` disabled both hosted scraping
+jobs and kept local Windows tasks as the sole scanner. That decision and
+its local telemetry / once-per-day snapshot refresh were preserved. The
+GitHub cost-artifact configuration is passive while those jobs are disabled;
+the local process reports are the active measurement path.
+
 ## Changes
 
 - Cursor pagination replaces OFFSET in known/finalized/no-info skip lists.
