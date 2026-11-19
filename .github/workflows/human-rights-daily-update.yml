@@ -1,0 +1,58 @@
+name: Human Rights Daily SOP Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: echr-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-notify:
+    # Local Windows tasks exclusively own the daily scan/notification queue.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install dependencies and browser
+        working-directory: ./db-old
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Scan the exact panel pool and resume the same notification turn
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          HUMAN_RIGHTS_DAILY_UPDATE_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
+          HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
+          DATABASE_NAME: echr-db
+          D1_COST_REPORT_FILE: ${{ github.workspace }}/local-data/d1-daily-query-costs.json
+        run: node scripts/echr-daily-supervisor.cjs
+      - name: Preserve measured D1 query costs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-daily-query-costs-${{ github.run_id }}
+          path: local-data/d1-daily-query-costs.*.json
+          if-no-files-found: ignore
+          retention-days: 31
+      - name: Preserve failure evidence without environment secrets
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-sop-failure-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            local-data/logs/
+            local-data/daily-sop-supervisor-state.json
+            local-data/daily-sop-checkpoint-*.json
+            local-data/daily-sop-reports/

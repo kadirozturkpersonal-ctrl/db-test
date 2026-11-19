@@ -1,0 +1,59 @@
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$runner = Join-Path $PSScriptRoot 'run-echr-local-scraper.ps1'
+$dailySopRunner = Join-Path $PSScriptRoot 'run-echr-local-daily-sop.ps1'
+$hiddenLauncher = 'D:\Projects\hukuki-is-dosya-yonetim-paneli\scripts\run-hidden-powershell.vbs'
+
+if (-not (Test-Path -LiteralPath $runner)) { throw "Çalıştırıcı bulunamadı: $runner" }
+if (-not (Test-Path -LiteralPath $dailySopRunner)) { throw "Günlük SOP çalıştırıcısı bulunamadı: $dailySopRunner" }
+if (-not (Test-Path -LiteralPath $hiddenLauncher)) { throw "Gizli çalıştırıcı bulunamadı: $hiddenLauncher" }
+
+$settings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 22)
+
+$definitions = @(
+    # A colon is not valid in a Windows Task Scheduler task name.  This single
+    # This continuous run begins at 02:00, gives current-year checks until
+    # 06:00, then continues its historical checkpoint cycle until 23:45.
+    @{ Name = 'ECHR Scraper - 0200'; Time = '02:00'; CurrentYear = $true; PriorityEndHour = 6 }
+)
+
+# Retire the two former slots so they cannot create a second browser session
+# or duplicate requests during the continuous daytime run.
+foreach ($legacyTask in 'ECHR Scraper - 0600', 'ECHR Scraper - 1200', 'ECHR Scraper - 1800') {
+    if (Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false
+    }
+}
+
+foreach ($definition in $definitions) {
+	# schtasks.exe on this Turkish Windows installation parses /SD as dd/MM/yyyy.
+	$firstRunDate = (Get-Date).Date.AddDays(1).ToString('dd/MM/yyyy')
+    $arguments = '"{0}" "{1}" -Slot "{2}"' -f $hiddenLauncher, $runner, $definition.Time
+    if ($definition.CurrentYear) { $arguments += " -CurrentYearPriority -CurrentYearPriorityEndHour $($definition.PriorityEndHour)" }
+    # schtasks creates the same InteractiveToken task type as the existing
+    # local automation on this computer. Register-ScheduledTask rejects that
+    # principal form on this Windows installation.
+    $taskCommand = '"{0}" {1}' -f "$env:WINDIR\System32\wscript.exe", $arguments
+    # Re-trigger every ten minutes throughout the daytime window.  When the
+    # scraper is healthy, IgnoreNew keeps this to one process.  If a network,
+    # browser, or power interruption ends that process, the following trigger
+    # resumes from its local checkpoint instead of waiting for the next day.
+	# Do not retroactively start a daytime scan when this installer is run after
+	# 02:00. The first new schedule run is tomorrow at its declared start time.
+    & schtasks.exe /Create /TN $definition.Name /TR $taskCommand /SC DAILY /SD $firstRunDate /ST $definition.Time /RI 10 /DU 21:45 /RU $env:USERNAME /IT /RL LIMITED /F | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Görev oluşturulamadı: $($definition.Name)" }
+    Set-ScheduledTask -TaskName $definition.Name -Settings $settings | Out-Null
+}
+
+# Use the same isolated recovery-aware installer when all tasks are installed.
+& (Join-Path $PSScriptRoot 'install-echr-daily-sop-task.ps1')
+
+Get-ScheduledTask -TaskName 'ECHR Scraper -*', 'ECHR Daily SOP Check - 0000' | Select-Object TaskName, State

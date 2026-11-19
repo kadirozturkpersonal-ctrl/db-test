@@ -1,0 +1,138 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('02:00', 'manual')]
+    [string]$Slot,
+    [switch]$CurrentYearPriority,
+    [ValidateRange(0, 23)]
+    [int]$CurrentYearPriorityEndHour = 6
+)
+
+$ErrorActionPreference = 'Stop'
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$scraperRoot = Join-Path $repoRoot 'db-old'
+$panelEnv = 'D:\Projects\hukuki-is-dosya-yonetim-paneli\.env.local'
+$runtimeDir = Join-Path $repoRoot 'local-data'
+$logDir = Join-Path $runtimeDir 'logs'
+$logPath = Join-Path $logDir ("echr-scraper-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
+$requiredNames = @('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID')
+
+New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
+$nodePath = if (Test-Path -LiteralPath 'C:\Program Files\nodejs\node.exe') {
+    'C:\Program Files\nodejs\node.exe'
+} else {
+    (Get-Command node -ErrorAction Stop).Source
+}
+
+function Import-SelectedEnvironmentFile {
+    param([string]$Path, [string[]]$AllowedNames)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Yerel AİHM yapılandırması bulunamadı: $Path"
+    }
+
+    $lines = Get-Content -LiteralPath $Path
+    foreach ($environmentName in $AllowedNames) {
+        $escapedName = [regex]::Escape($environmentName)
+        $line = $lines | Where-Object { $_ -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$" } | Select-Object -Last 1
+        if ($null -eq $line) { continue }
+        $null = $line -match "^\s*$escapedName\s*=\s*(?<value>.*)\s*$"
+        $value = $matches.value.Trim()
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        [Environment]::SetEnvironmentVariable($environmentName, $value, 'Process')
+    }
+}
+
+Import-SelectedEnvironmentFile -Path $panelEnv -AllowedNames $requiredNames
+
+foreach ($name in $requiredNames) {
+    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
+        throw "Gerekli yerel AİHM yapılandırması eksik: $name"
+    }
+}
+
+# Keep all mutable runtime files outside the Git checkout. The scraper resumes from
+# this local checkpoint even if GitHub is unreachable.
+$env:SCRAPER_STATE_FILE = Join-Path $runtimeDir 'scraper-state.json'
+$env:SCRAPER_FAILURE_REPORT_FILE = Join-Path $runtimeDir 'scraper-failure.json'
+$env:SCRAPER_ACTIVITY_FILE = Join-Path $runtimeDir 'echr-scraper-live.jsonl'
+$env:SCRAPER_SCHEDULE_SLOT = $Slot
+$env:SCRAPER_RUN_SOURCE = 'local-windows-task'
+$env:SCRAPER_RUN_SOURCE_REFERENCE = "ECHR Scraper - $($Slot.Replace(':', ''))"
+$env:SCRAPER_LOGICAL_CYCLE_ID = "local-$(Get-Date -Format 'yyyy-MM-dd')"
+$env:RUN_CURRENT_YEAR_PRIORITY_SCAN = if ($CurrentYearPriority) { 'true' } else { 'false' }
+$env:CURRENT_YEAR_PRIORITY_END_HOUR = [string]$CurrentYearPriorityEndHour
+$env:SCRAPER_REQUEST_DELAY_MS = '1350'
+$env:MAX_CONSECUTIVE_EMPTY = '500'
+$env:D1_COST_REPORT_FILE = Join-Path $runtimeDir 'd1-monthly-query-costs.json'
+# One continuous daytime run is intentionally used instead of three separate
+# runs.  Keep a 15-minute margin before midnight so the scraper can checkpoint
+# and exit cleanly.  If Task Scheduler starts the task late (for example after
+# a restart), reduce the budget so it still never spills into the next day.
+$localNow = Get-Date
+$safeStopAt = $localNow.Date.AddDays(1).AddMinutes(-15)
+$remainingMinutes = [math]::Floor(($safeStopAt - $localNow).TotalMinutes)
+if ($remainingMinutes -lt 1) {
+    "[$(Get-Date -Format o)] Local ECHR scraper was started too close to midnight; no safe runtime remains." | Add-Content -LiteralPath $logPath
+    exit 0
+}
+$env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes
+$env:SAFE_STOP_BUFFER_MINUTES = '15'
+$env:SCRAPE_ATTEMPT_TIMEOUT_MS = '60000'
+$env:BROWSER_MAX_UPTIME_MINUTES = '90'
+$env:ECHR_PUBLISHED_SNAPSHOT_REFRESH_URL = 'http://localhost:3000/api/echr-db/refresh'
+# Use the same version-matched headless runtime verified by the nightly task,
+# not an independently updated desktop Chrome / CDP protocol combination.
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $runtimeDir 'playwright-browsers'
+$env:ECHR_BROWSER_EXECUTABLE_PATH = $null
+$loggedChild = Join-Path $PSScriptRoot 'echr-log-child.cjs'
+& $nodePath $loggedChild $logPath $scraperRoot (Join-Path $PSScriptRoot 'echr-browser-runtime.cjs')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The 02:00 full scan must not take the writer from an unfinished daily turn.
+# Wait within the existing daily recovery window; completed days proceed at once.
+while ($Slot -eq '02:00') {
+    $dailyNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'Turkey Standard Time')
+    if ($dailyNow.TimeOfDay -ge [TimeSpan]::new(3,57,0)) { break }
+    $dailyStateFile = Join-Path $runtimeDir 'daily-sop-supervisor-state.json'
+    if (Test-Path -LiteralPath $dailyStateFile) {
+        $dailyState = [System.IO.File]::ReadAllText($dailyStateFile) | ConvertFrom-Json
+        if ($dailyState.date -eq $dailyNow.ToString('yyyy-MM-dd') -and $dailyState.status -eq 'completed') { break }
+    }
+    "[$(Get-Date -Format o)] Waiting for the daily SOP/notification turn before taking its writer lock." | Add-Content -LiteralPath $logPath
+    Start-Sleep -Seconds 30
+}
+# Waiting consumes the original calendar-day budget; never carry it past midnight.
+$remainingMinutes = [math]::Floor(($safeStopAt - (Get-Date)).TotalMinutes)
+if ($remainingMinutes -lt 1) { exit 0 }
+$env:MAX_RUNTIME_MINUTES = [string]$remainingMinutes
+$mutex = New-Object System.Threading.Mutex($false, 'Local\EchrMonthlyScraper')
+$ownsMutex = $false
+try { $ownsMutex = $mutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
+if (-not $ownsMutex) {
+    "[$(Get-Date -Format o)] Another ECHR scraper run is already active; this slot was skipped." | Add-Content -LiteralPath $logPath
+    exit 0
+}
+
+try {
+    "`n[$(Get-Date -Format o)] Starting local ECHR scraper: slot=$Slot currentYearPriority=$($env:RUN_CURRENT_YEAR_PRIORITY_SCAN)" | Add-Content -LiteralPath $logPath
+    Push-Location $scraperRoot
+    try {
+        & $nodePath $loggedChild $logPath $scraperRoot d1-target.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        & $nodePath $loggedChild $logPath $scraperRoot monthly-scraper.js
+        exit $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+}
+finally {
+    if ($ownsMutex) { $mutex.ReleaseMutex() | Out-Null }
+    $mutex.Dispose()
+}

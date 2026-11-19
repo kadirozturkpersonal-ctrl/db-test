@@ -1,0 +1,233 @@
+const { chromium } = require('playwright');
+const { log } = require('./debug');
+
+// Native Playwright is deliberately used for the local scheduler. The
+// playwright-extra/Puppeteer compatibility layer cannot spawn Chromium
+// reliably under Windows Task Scheduler.
+
+const DEFAULT_MAX_RETRIES = 2;
+// GitHub-hosted runners can need noticeably longer than a local browser before
+// SOP hydrates the result panel. A missing panel is not itself proof that the
+// application is absent from SOP.
+const SOP_RESULT_TIMEOUT_MS = 30000;
+const BROWSER_LAUNCH_TIMEOUT_MS = 60000;
+const CONTEXT_CLOSE_TIMEOUT_MS = 5000;
+
+class TemporaryScrapeError extends Error {
+	constructor(message, cause) {
+		super(message);
+		this.name = 'TemporaryScrapeError';
+		this.temporary = true;
+		this.cause = cause;
+	}
+}
+
+function isTemporaryScrapeError(error) {
+	return Boolean(error && error.temporary === true);
+}
+
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Create a reusable browser instance.
+ * Caller is responsible for calling browser.close() when done.
+ */
+async function createBrowser(options = {}) {
+	log('🌐 Launching browser (will be reused for all cases)...', true);
+	const env = options.env || process.env;
+	const launch = options.launch || (settings => chromium.launch(settings));
+	const delay = options.sleep || sleep;
+	const executablePath = String(env.ECHR_BROWSER_EXECUTABLE_PATH || '').trim();
+	// Keep the version-matched headless shell independent of desktop Chrome.
+	// An explicit override may be tried first, but cannot block bundled recovery.
+	const targets = executablePath ? [{ executablePath }, {}] : [{}, {}];
+	let lastError;
+	for (let attempt = 0; attempt < targets.length; attempt++) {
+		try {
+			const browser = await launch({ headless: true, ...targets[attempt], timeout: BROWSER_LAUNCH_TIMEOUT_MS });
+			log(`   ✓ Browser ready: ${targets[attempt].executablePath ? 'configured executable' : 'Playwright bundled headless'} (attempt ${attempt + 1})`, true);
+			return browser;
+		} catch (error) {
+			lastError = error;
+			log(`   ⚠️ Browser startup ${attempt + 1}/${targets.length}: ${String(error.message).split('\n')[0]}`, true);
+			if (attempt + 1 < targets.length) await delay(1000);
+		}
+	}
+	throw new TemporaryScrapeError(`Browser startup failed after ${targets.length} bounded attempts: ${lastError.message}`, lastError);
+}
+
+/**
+ * Scrapes a single ECHR application page using a shared browser.
+ * Returns null if not found, otherwise returns complete data.
+ *
+ * @param {import('playwright').Browser} browser - Shared browser instance
+ * @param {number|string} applicationNumber - Case number
+ * @param {number|string} applicationYear - Case year (last 2 digits)
+ */
+async function scrapeECHRApplicationOnce(browser, applicationNumber, applicationYear) {
+	const url = `https://app.echr.coe.int/SOP/en-GB/application?number=${applicationNumber}%2F${applicationYear}`;
+
+	log(`🔍 Checking: ${applicationNumber}/${applicationYear}`, true);
+
+	// Fresh context per case (isolates cookies/storage between cases).
+	// Chromium may be restarted by the outer deadline while this setup is in
+	// flight, so setup errors must follow the same retry path as page errors.
+	let context;
+	let scrapeError;
+
+	try {
+		context = await browser.newContext();
+		const page = await context.newPage();
+		// These resources contain no SOP evidence; keep scripts and styles intact.
+		await page.route('**/*', route => ['image', 'media', 'font'].includes(route.request().resourceType()) ? route.abort() : route.continue());
+
+		// Navigate to the URL
+		const response = await page.goto(url, {
+			waitUntil: 'domcontentloaded',
+			timeout: 30000
+		});
+		if (response && !response.ok()) {
+			throw new TemporaryScrapeError(`SOP HTTP ${response.status()}; kaynak yanıtı doğrulanamadı.`);
+		}
+
+		// Wait for either a real result or SOP's explicit error panel.  Do not
+		// convert a slow/blocked page into a "not found" record: that would
+		// overwrite the health signal of every application in a daily run.
+		const panel = await page.waitForSelector('#ResultPanel:visible, #error-container:visible', { timeout: SOP_RESULT_TIMEOUT_MS });
+		const outcome = await panel.getAttribute('id');
+
+		if (outcome === 'error-container') {
+			log(`   ⚠️  SOP returned no information`, true);
+			return null;
+		}
+
+		if (outcome !== 'ResultPanel') {
+			throw new Error(`SOP result panel did not load within ${SOP_RESULT_TIMEOUT_MS / 1000} seconds`);
+		}
+
+		// Extract ALL data from the page
+		const data = await page.evaluate(() => {
+			const getText = (selector) => {
+				const element = document.querySelector(selector);
+				return element ? element.textContent.trim() : null;
+			};
+
+			const applicationNumber = getText('#ApplicationNumber p');
+			const applicationTitle = getText('#ApplicationTitle p');
+			const dateIntroduction = getText('#DateIntroduction p');
+			const representant = getText('#Representant p');
+
+			const majorEventsList = [];
+			const rows = document.querySelectorAll('#MajorEventsList tbody tr');
+
+			rows.forEach(row => {
+				const description = row.querySelector('td:nth-child(1)')?.textContent.trim();
+				const eventDate = row.querySelector('td:nth-child(2)')?.textContent.trim();
+
+				if (description && eventDate) {
+					majorEventsList.push({
+						description: description,
+						eventDate: eventDate
+					});
+				}
+			});
+
+			let lastMajorEvent = null;
+			let lastMajorEventDate = null;
+
+			if (majorEventsList.length > 0) {
+				const lastEvent = majorEventsList[majorEventsList.length - 1];
+				lastMajorEvent = lastEvent.description;
+				lastMajorEventDate = lastEvent.eventDate;
+			}
+
+			return {
+				applicationNumber,
+				applicationTitle,
+				dateIntroduction,
+				representant,
+				lastMajorEvent,
+				lastMajorEventDate,
+				majorEventsList
+			};
+		});
+
+		// Validate essential data
+		if (!data.applicationNumber || !data.applicationTitle) {
+			throw new TemporaryScrapeError('SOP result is incomplete; missing application number or title.');
+		}
+		const expectedNumber = `${Number(applicationNumber)}/${String(applicationYear).slice(-2).padStart(2, '0')}`;
+		const actualNumber = String(data.applicationNumber).replace(/\s/g, '').replace(/^0+(?=\d)/, '');
+		if (actualNumber !== expectedNumber) throw new TemporaryScrapeError(`SOP application mismatch: requested ${expectedNumber}, received ${actualNumber}.`);
+
+		// Pretty print the results
+		log(`   ✅ Found: ${data.applicationTitle}`);
+		log(`   👤 Representative: ${data.representant || 'N/A'}`);
+		log(`   📅 Introduced: ${data.dateIntroduction || 'N/A'}`);
+		log(`   📋 Events: ${data.majorEventsList.length}`);
+		log(`   🔔 Last Event: ${data.lastMajorEvent || 'N/A'}`);
+		log(`   📆 Last Event Date: ${data.lastMajorEventDate || 'N/A'}`);
+
+		return data;
+
+	} catch (error) {
+		log(`   ❌ Error: ${error.message}`, true);
+		scrapeError = isTemporaryScrapeError(error) ? error : new TemporaryScrapeError(error.message, error);
+		throw scrapeError;
+	} finally {
+		// Context teardown can stall too. Do not let it consume every retry or
+		// turn a partial response into an authoritative no-info result.
+		if (context) {
+			let timer;
+			try {
+				await Promise.race([
+					Promise.resolve().then(() => context.close()),
+					new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('SOP context cleanup timed out')), CONTEXT_CLOSE_TIMEOUT_MS); }),
+				]);
+			} catch (error) {
+				log(`   ⚠️  Could not close browser context: ${error.message}`, true);
+				if (!scrapeError) throw new TemporaryScrapeError(error.message, error);
+			} finally { clearTimeout(timer); }
+		}
+	}
+}
+
+/**
+ * Scrape an application, retrying only temporary technical failures.
+ * Real no-info SOP results still return null without retry.
+ */
+async function scrapeECHRApplication(browser, applicationNumber, applicationYear, options = {}) {
+	const maxRetries = options.maxRetries === undefined
+		? DEFAULT_MAX_RETRIES
+		: Math.max(0, parseInt(options.maxRetries, 10) || 0);
+	const maxAttempts = maxRetries + 1;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			if (attempt > 1) {
+				log(`   🔁 Retry ${attempt - 1}/${maxRetries} for ${applicationNumber}/${applicationYear}`, true);
+			}
+
+			return await scrapeECHRApplicationOnce(browser, applicationNumber, applicationYear);
+		} catch (error) {
+			if (!isTemporaryScrapeError(error) || attempt >= maxAttempts) {
+				throw error;
+			}
+
+			const delayMs = Math.min(8000, 1000 * (2 ** attempt));
+			log(`   ⏳ Temporary scrape error; waiting ${delayMs}ms before retry`, true);
+			await sleep(delayMs);
+		}
+	}
+
+	return null;
+}
+
+module.exports = {
+	scrapeECHRApplication,
+	createBrowser,
+	isTemporaryScrapeError,
+	TemporaryScrapeError
+};

@@ -1,0 +1,76 @@
+# Günlük SOP görevi ve kesinti kurtarma
+
+Windows görevi `ECHR Daily SOP Check - 0000`, Türkiye saatiyle 00:00'da
+başlar. 03:57'ye kadar on dakikada bir yeniden tetiklenir; `IgnoreNew` ve
+tek-süreç kilidi aynı anda ikinci tarayıcıyı önler. Görev hatalarında ayrıca
+beş dakika arayla üç yeniden başlatma bulunur. Sadece bu görevi kurmak için:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-echr-daily-sop-task.ps1
+```
+
+Eski `ECHR Daily SOP Check - 0007` görevi silinmez; çift çalışmayı önlemek
+için devre dışı bırakılır. Geçmiş 00:07 tarama kayıtları panelde korunur.
+
+## İşleyiş
+
+Tarayıcı, sürümü Playwright ile eşleşen headless Chromium'u kullanır; masaüstü
+Chrome'u zorlanmaz. Başlatma 60 saniye ile sınırlı iki denemeye sahiptir.
+SOP sayfa/sonuç beklemeleri 30 saniyedir. Resim, medya ve font istekleri
+engellenir; sonuç betikleri ve stilleri korunur. Eski 01:57 kesilmesi yerine
+03:57 kurtarma sınırı uygulanır; başlangıç yine 00:00'dır.
+
+Tarayıcılar kullanıcı AppData önbelleği yerine `local-data/playwright-browsers`
+altında tutulur. Her tamamlanmamış günlük çalışmanın başında paket sürümüyle
+eşleşen headless tarayıcı CLI üzerinden kontrol edilir; eksikse kurulur ve
+gerçek bir tarayıcı açılışıyla doğrulanır. Bu adım başarısızsa tarama veya
+e-posta başlamaz. `browser-task-probe.cjs` yalnız güvenli yol/erişim/açılış
+tanılarını kaydeder; gizli ortam değerlerini yazmaz ve SOP sorgusu yapmaz.
+02:00 genel tarama, günlük çalışma tamamlanmadıysa 03:57'ye kadar onun yazma
+kilidine öncelik verir. Böylece günlük kurtarma genel taramanın arkasında kalmaz.
+
+Kullanıcının açıkça onayladığı gündüz kurtarması için aşağıdaki komut bugünün
+aynı checkpoint ve günlük run kaydını sürdürür (en fazla 120 dakika ve aynı
+Türkiye günü). Yeni bir 25'li tur açmaz; donmuş periyodik kapsam korunur:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-echr-local-daily-sop.ps1 -RecoverToday
+```
+
+1. Kimlik doğrulamalı panel GET endpointinden o günün SOP havuzu alınır.
+   AYM, numarasız dosyalar, nihai SOP ve doğrulanmış HUDOC kararları taranmaz.
+   Çarşamba HUDOC aşaması varsa önce panelde tamamlanır; diğer günler HUDOC
+   sorgusu yapılmaz. Eski D1 abonelik listesine sessiz geri dönüş yoktur.
+2. Her SOP sonucu küçük D1 REST sorgusuyla yazılır. Tek kayıt için bulk/R2
+   import veya Wrangler/PowerShell çıktı hattı kullanılmaz.
+3. Başarılı her kayıttan sonra aynı Türkiye gününe ait atomik checkpoint
+   yazılır. Çökme/yeniden başlatmada yalnız tamamlanmamış kayıtlar taranır.
+4. Beş dakika ilerlemeyen sahipli alt süreç sonlandırılır ve tekrar denenir.
+   Hata kodu, sinyal ve stdout/stderr ayrı UTF-8 günlüklerine kaydedilir.
+   Destekleyen Node sürümlerinde ortam değişkenleri hariç fatal rapor açılır.
+5. Kaynak tarama tamamlanmadan panel e-posta sırasını tüketmez. Tamamlanınca
+   aynı günlük run devam eder. Yarım kalan gönderim aynı donmuş kapsamı
+   kullanır; yeni 25 kişi seçilmez. Kaydedilmiş alıcı hataları otomatik tekrar
+   gönderilmez; panelden elle yeniden denenir.
+6. Geçici panel 408/429/5xx veya ağ hatası, aynı istek gövdesi ve aynı günlük
+   kayıtla üç kez denenir. Kimlik/iş kuralı hataları bu yolla aşılmaz.
+
+## Yerel kanıtlar
+
+- `local-data/daily-sop-supervisor-state.json`: faz, deneme ve hata yığını.
+- `local-data/daily-sop-checkpoint-YYYY-MM-DD.json`: tamamlanan kayıtlar.
+- `local-data/logs/echr-daily-supervisor-YYYY-MM-DD.log`: süreç çıkışları.
+- `local-data/logs/echr-daily-sop-YYYY-MM-DD-attempt-*.log`: stdout/stderr.
+- `local-data/daily-sop-reports/YYYY-MM-DD/`: varsa fatal Node raporları.
+
+`-Preflight` yalnız yerel yapılandırmayı kontrol eder; tarama, D1 yazımı veya
+e-posta göndermez. Testler:
+
+```powershell
+node --test db-old/*.test.js scripts/echr-daily-supervisor.test.cjs
+```
+
+Bilgisayarın açık/oturumun kullanılabilir ve ağın erişilebilir olması gerekir.
+Harici SOP/D1/e-posta hizmetinin kesintisizliği garanti edilemez. Süre sınırı
+veya sürekli kesintide görev başarı raporlamaz; checkpoint ve hata kanıtı
+korunur. Kurulum günü gündüz taraması başlatılmaz; ilk yeni tetik ertesi gece.

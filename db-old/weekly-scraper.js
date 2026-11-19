@@ -1,0 +1,445 @@
+#!/usr/bin/env node
+
+/**
+ * Weekly ECHR Scraper - Quick Updates for Subscribed Cases
+ * 
+ * Purpose: Only scrapes cases that have active subscriptions
+ * This is much faster than the monthly full scan
+ * 
+ * Expected runtime: 20-30 minutes for ~600 cases
+ * vs 4-6 hours for monthly full scan of 50,000+ cases
+ */
+
+require('dotenv').config();
+const fs = require('fs');
+const crypto = require('crypto');
+const { scrapeECHRApplication, createBrowser, isTemporaryScrapeError } = require('./improved-scraper');
+const { D1Adapter, ISTANBUL_SQL_DATE } = require('./d1-adapter');
+const { isD1StopError } = require('./d1-runtime-errors');
+const { log } = require('./debug');
+const { writeJsonAtomic, readCheckpoint } = require('./daily-sop-checkpoint');
+
+function getIstanbulDate() {
+	return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Istanbul' }).format(new Date());
+}
+
+class WeeklyECHRScraper {
+	constructor(databaseName = 'echr-db', dependencies = {}) {
+		// Daily writes use the small-record D1 REST query path, never Wrangler/R2.
+		this.d1 = dependencies.d1 || new D1Adapter(databaseName);
+		this.createBrowser = dependencies.createBrowser || createBrowser;
+		this.scrapeApplication = dependencies.scrapeApplication || scrapeECHRApplication;
+		this.databaseName = databaseName;
+		this.browser = null;
+		this.sourceUnavailable = false;
+		this.runId = crypto.randomUUID();
+		this.runStartedAt = new Date().toISOString();
+		this.currentApplicationNumber = null;
+		this.processedCount = 0;
+		// The local daily runner supplies a dedicated file for the panel's
+		// per-application result view. Keep this opt-in so unrelated CLI runs
+		// do not create an activity file unexpectedly.
+		this.activityFile = process.env.DAILY_SOP_ACTIVITY_FILE || null;
+		this.verifiedApplicationNumbers = new Set();
+		this.checkpointFile = process.env.DAILY_SOP_CHECKPOINT_FILE || null;
+		this.scopeFile = process.env.DAILY_SOP_SCOPE_FILE || null;
+		this.businessDate = getIstanbulDate();
+		this.completedResults = new Map();
+
+		// Stats
+		this.stats = {
+			total: 0,
+			updated: 0,
+			unchanged: 0,
+			notFound: 0,
+			errors: 0
+		};
+		this.consecutiveTechnicalFailures = 0;
+	}
+
+	checkpoint() {
+		if (!this.checkpointFile) return;
+		writeJsonAtomic(this.checkpointFile, {
+			version: 1, date: this.businessDate, runId: this.runId,
+			startedAt: this.runStartedAt, updatedAt: new Date().toISOString(),
+			results: [...this.completedResults.values()],
+		});
+	}
+
+	restoreCheckpoint(cases) {
+		const stored = readCheckpoint(this.checkpointFile, this.businessDate);
+		if (!stored) return;
+		this.runId = stored.runId;
+		this.runStartedAt = stored.startedAt;
+		const allowed = new Set(cases.map(row => row.application_number));
+		for (const result of stored.results) {
+			if (!allowed.has(result.applicationNumber) || !['found', 'no_info'].includes(result.type)) continue;
+			this.completedResults.set(result.applicationNumber, result);
+			if (result.type === 'found') {
+				this.verifiedApplicationNumbers.add(result.applicationNumber);
+				this.stats[result.changed ? 'updated' : 'unchanged']++;
+			} else this.stats.notFound++;
+		}
+		this.processedCount = this.completedResults.size;
+		log(`Resuming daily SOP checkpoint: ${this.processedCount}/${cases.length} already completed.`, true);
+	}
+
+	recordActivity(type, details = {}) {
+		if (!this.activityFile) return;
+		try {
+			fs.appendFileSync(this.activityFile, `${JSON.stringify({
+				at: new Date().toISOString(),
+				runId: this.runId,
+				phase: 'daily-subscription-sop',
+				type,
+				...details,
+			})}\n`);
+		} catch (error) {
+			log(`   ⚠️ Could not record daily SOP activity: ${error.message}`, true);
+		}
+	}
+
+	async startDailyRun() {
+		await this.d1.querySQL(`CREATE TABLE IF NOT EXISTS echr_scraper_runs (
+			id TEXT PRIMARY KEY, schedule_slot TEXT NOT NULL, run_mode TEXT NOT NULL, status TEXT NOT NULL,
+			started_at TEXT NOT NULL, completed_at TEXT, new_applications_added INTEGER NOT NULL DEFAULT 0,
+			applications_saved INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0, error_message TEXT
+		)`);
+		for (const column of ['current_application_number TEXT', 'processed_count INTEGER NOT NULL DEFAULT 0', 'total_count INTEGER NOT NULL DEFAULT 0', 'checked_per_minute REAL', 'last_heartbeat_at TEXT']) {
+			try { await this.d1.querySQL(`ALTER TABLE echr_scraper_runs ADD COLUMN ${column}`); }
+			catch (error) { if (!/duplicate column name/i.test(String(error?.message || error))) throw error; }
+		}
+		await this.d1.querySQL(`INSERT INTO echr_scraper_runs (id, schedule_slot, run_mode, status, started_at, total_count) VALUES (?, '00:00', 'daily-subscription-sop', 'running', ?, ?)
+			ON CONFLICT(id) DO UPDATE SET status = 'running', completed_at = NULL, error_message = NULL, total_count = excluded.total_count`, [this.runId, this.runStartedAt, this.stats.total]);
+		this.checkpoint();
+		this.recordActivity('run_started', { caseCount: this.stats.total, message: 'Yerel günlük SOP taraması başladı.' });
+		await this.publishProgress();
+	}
+
+	async publishProgress() {
+		const elapsedMinutes = Math.max(1 / 60, (Date.now() - Date.parse(this.runStartedAt)) / 60000);
+		await this.d1.querySQL(`UPDATE echr_scraper_runs SET current_application_number = ?, processed_count = ?, total_count = ?, checked_per_minute = ?, applications_saved = ?, error_count = ?, last_heartbeat_at = ? WHERE id = ?`, [this.currentApplicationNumber, this.processedCount, this.stats.total, Number((this.processedCount / elapsedMinutes).toFixed(2)), this.stats.updated, this.stats.errors, new Date().toISOString(), this.runId]);
+	}
+
+	async finishDailyRun(error = null) {
+		await this.publishProgress().catch(() => undefined);
+		await this.d1.querySQL(`UPDATE echr_scraper_runs SET status = ?, completed_at = ?, error_message = ? WHERE id = ?`, [error || this.sourceUnavailable || this.stats.errors ? 'failed' : 'completed', new Date().toISOString(), error ? String(error.stack || error).slice(0, 2000) : this.sourceUnavailable ? 'SOP source temporarily unavailable' : this.stats.errors ? `${this.stats.errors} application(s) need retry` : null, this.runId]);
+		this.recordActivity(error || this.sourceUnavailable ? 'run_failed' : 'run_completed', {
+			caseCount: this.processedCount,
+			message: error ? String(error.message || error) : this.sourceUnavailable ? 'SOP kaynağı geçici olarak kullanılamadı.' : 'Yerel günlük SOP taraması tamamlandı.',
+		});
+	}
+
+	/**
+	 * The panel sends a periodic email only when D1 proves that the SOP record
+	 * was checked on the current Istanbul business date.  Confirm that each
+	 * successful daily scrape has actually reached that same D1 target before
+	 * allowing the runner to call the panel notification endpoint.
+	 */
+	async verifyDailyD1Writes() {
+		if (!this.activityFile || this.verifiedApplicationNumbers.size === 0) return;
+
+		const expectedDate = getIstanbulDate();
+		const applicationNumbers = [...this.verifiedApplicationNumbers];
+		const rowsByApplicationNumber = new Map();
+
+		for (let offset = 0; offset < applicationNumbers.length; offset += 100) {
+			const batch = applicationNumbers.slice(offset, offset + 100);
+			const placeholders = batch.map(() => '?').join(', ');
+			const rows = await this.d1.querySQL(
+				`SELECT application_number, last_checked_date FROM applications WHERE application_number IN (${placeholders})`,
+				batch,
+			);
+			for (const row of rows) {
+				rowsByApplicationNumber.set(String(row.application_number || '').trim(), row.last_checked_date || null);
+			}
+		}
+
+		const stale = applicationNumbers.filter((applicationNumber) => rowsByApplicationNumber.get(applicationNumber) !== expectedDate);
+		if (stale.length > 0) {
+			throw new Error(`D1 Istanbul tarih dogrulamasi basarisiz: ${stale.length}/${applicationNumbers.length} SOP kaydi ${expectedDate} tarihini tasimiyor.`);
+		}
+
+		log(`✅ D1 Istanbul tarih doğrulaması tamamlandı: ${applicationNumbers.length}/${applicationNumbers.length} kayıt (${expectedDate})`, true);
+	}
+
+	/**
+	 * Get all subscribed case numbers from database
+	 */
+	async getSubscribedCases() {
+		log('\n📋 Fetching subscribed cases from database...', true);
+		if (this.scopeFile) {
+			const scope = JSON.parse(fs.readFileSync(this.scopeFile, 'utf8'));
+			if (scope.date !== this.businessDate || !Array.isArray(scope.applicationNumbers)) {
+				throw new Error('The panel SOP scope must belong to the current Istanbul date.');
+			}
+			const numbers = [...new Set(scope.applicationNumbers)];
+			if (numbers.some(number => !/^\d{1,8}\/\d{2}$/.test(number))) throw new Error('Invalid application number in panel scope.');
+			const existing = new Map();
+			for (let offset = 0; offset < numbers.length; offset += 100) {
+				const batch = numbers.slice(offset, offset + 100);
+				const rows = await this.d1.querySQL(`SELECT id as case_id, application_number, last_major_event as current_event FROM applications WHERE application_number IN (${batch.map(() => '?').join(',')})`, batch);
+				for (const row of rows) existing.set(row.application_number, row);
+			}
+			// The authenticated panel classifier is the source of truth, including
+			// new numbers not yet present in D1. No legacy subscription fallback.
+			return numbers.map(number => existing.get(number) || { application_number: number, current_event: null });
+		}
+		if (process.env.DAILY_SOP_REQUIRE_PANEL_SCOPE === 'true') throw new Error('Authenticated panel SOP scope is required.');
+
+		// TESTING MODE: Only get 3 cases
+		// Remove LIMIT when ready for full run
+		const sql = `
+			SELECT DISTINCT 
+				s.case_id,
+				s.application_number,
+				a.last_major_event as current_event
+			FROM subscriptions s
+			INNER JOIN applications a ON s.case_id = a.id
+			WHERE s.is_active = 1
+			AND a.is_closed = 0
+			ORDER BY s.application_number
+		`;
+
+		try {
+			// Use the D1 REST client rather than the legacy Wrangler shell command.
+			// The shell command loses its multi-line SQL argument under Windows Task
+			// Scheduler, while querySQL sends the same query directly to D1.
+			const cases = await this.d1.querySQL(sql);
+
+			log(`✅ Found ${cases.length} subscribed cases to check\n`, true);
+			return cases;
+
+		} catch (error) {
+			log(`❌ Error fetching subscribed cases: ${error.message}`, true);
+			throw error;
+		}
+	}
+
+	/**
+	 * Main scraping loop
+	 */
+	async run() {
+		log('\n🚀 Starting ECHR Weekly Scraper', true);
+		log('='.repeat(60), true);
+		log(`Database: ${this.databaseName}`, true);
+		log('Purpose: Check subscribed cases for updates', true);
+		log('='.repeat(60), true);
+
+		// Get subscribed cases
+		const subscribedCases = await this.getSubscribedCases();
+		this.stats.total = subscribedCases.length;
+		this.restoreCheckpoint(subscribedCases);
+		await this.startDailyRun();
+
+		if (subscribedCases.length === 0) {
+			log('\n⚠️  No subscribed cases found. Nothing to scrape.', true);
+			await this.finishDailyRun();
+			this.writeWorkflowOutcome();
+			return { sourceAvailable: true };
+		}
+
+		log(`\n📊 Processing ${subscribedCases.length} cases...`, true);
+		log('-'.repeat(60), true);
+
+		// Launch browser ONCE for the entire run
+		let runError = null;
+		try {
+			if (this.processedCount < subscribedCases.length) this.browser = await this.createBrowser();
+			// Process each case
+			for (let i = 0; i < subscribedCases.length; i++) {
+				const caseInfo = subscribedCases[i];
+				if (this.completedResults.has(caseInfo.application_number)) continue;
+				if (getIstanbulDate() !== this.businessDate) throw new Error('Istanbul business date changed; daily scan stopped.');
+				this.currentApplicationNumber = caseInfo.application_number;
+				const progress = `[${i + 1}/${subscribedCases.length}]`;
+
+				log(`\n${progress} Checking: ${caseInfo.application_number}`, true);
+				log(`   Current event: ${caseInfo.current_event || 'None'}`, true);
+
+				try {
+					// Parse application number (format: "12345/21")
+					const [number, year] = caseInfo.application_number.split('/');
+
+					// Scrape the case (reusing the shared browser)
+					const data = await this.scrapeApplication(this.browser, number, year);
+
+					if (data) {
+						this.consecutiveTechnicalFailures = 0;
+						// Check if event changed
+						const newEvent = data.lastMajorEvent;
+						const hasChanged = newEvent !== caseInfo.current_event;
+
+						if (hasChanged) {
+							log(`   🔔 EVENT CHANGED!`, true);
+							log(`   Old: ${caseInfo.current_event}`, true);
+							log(`   New: ${newEvent}`, true);
+						} else {
+							log(`   ✓ No change`, true);
+						}
+						// Save through the D1 Import API. The legacy single-record path
+						// shells out to Wrangler, which is not reliable in Windows Task
+						// Scheduler.
+						const saved = await this.d1.saveDailyApplication(data);
+						if (saved.failed > 0) {
+							throw new Error('D1 application update could not be saved.');
+						}
+						this.verifiedApplicationNumbers.add(caseInfo.application_number);
+						this.stats[hasChanged ? 'updated' : 'unchanged']++;
+						this.completedResults.set(caseInfo.application_number, { applicationNumber: caseInfo.application_number, type: 'found', changed: hasChanged });
+						this.checkpoint();
+						this.recordActivity('found', {
+							applicationNumber: caseInfo.application_number,
+							knownInD1: true,
+							title: data.title || null,
+							lastEvent: data.lastMajorEvent || null,
+							lastEventDate: data.lastMajorEventDate || null,
+							message: hasChanged ? 'SOP kaydı bulundu · aşama değişikliği tespit edildi.' : 'SOP kaydı bulundu · değişiklik yok.',
+						});
+
+					} else {
+						this.consecutiveTechnicalFailures = 0;
+						// SOP explicitly returned no information for this valid query.
+						log(`   ⚠️  SOP returned no information`, true);
+						this.recordActivity('no_info', {
+							applicationNumber: caseInfo.application_number,
+							knownInD1: true,
+							message: 'SOP bilgi döndürmedi; mevcut D1 kaydı korundu.',
+						});
+
+						// Keep the same not-found semantics without the legacy Wrangler
+						// command runner.
+						await this.d1.querySQL(
+							`UPDATE applications
+							 SET not_found_count = not_found_count + 1,
+								 last_checked_date = ${ISTANBUL_SQL_DATE},
+								 skip_scraping = CASE WHEN not_found_count + 1 >= 60 THEN 1 ELSE skip_scraping END,
+								 updated_at = CURRENT_TIMESTAMP
+							 WHERE application_number = ?`,
+							[`${number}/${year}`],
+						);
+						this.stats.notFound++;
+						this.completedResults.set(caseInfo.application_number, { applicationNumber: caseInfo.application_number, type: 'no_info' });
+						this.checkpoint();
+					}
+
+				} catch (error) {
+					if (isD1StopError(error)) throw error;
+					log(`   ❌ Error: ${error.message}`, true);
+					this.stats.errors++;
+					this.recordActivity('technical_error', {
+						applicationNumber: caseInfo.application_number,
+						knownInD1: true,
+						message: String(error.stack || error),
+					});
+
+					// A sequence of pages that cannot produce either an SOP result or
+					// SOP's own no-information response means the source is currently
+					// unavailable to this runner. Stop before invoking the notification
+					// queue; otherwise stale data could be presented as a completed scan.
+					if (isTemporaryScrapeError(error)) {
+						this.consecutiveTechnicalFailures++;
+						if (this.consecutiveTechnicalFailures >= 5) {
+							this.sourceUnavailable = true;
+							log('   ⚠️  SOP source is unavailable after 5 consecutive technical failures; deferring the subscription scan to the next scheduled run.', true);
+							break;
+						}
+					} else {
+						this.consecutiveTechnicalFailures = 0;
+					}
+				}
+
+				// Rate limiting - be nice to ECHR servers
+				// Wait 500ms between requests
+				await this.sleep(300);
+				this.processedCount = this.completedResults.size;
+				await this.publishProgress();
+			}
+
+			if (this.sourceUnavailable) {
+				log('\n⏱️  Subscription scan deferred. No records or notifications were changed.', true);
+			} else {
+				await this.verifyDailyD1Writes();
+			}
+			if (this.stats.errors || this.processedCount !== this.stats.total) {
+				throw new Error(`Daily SOP scan incomplete: ${this.processedCount}/${this.stats.total}; ${this.stats.errors} errors. Checkpoint retained for retry.`);
+			}
+
+			// Print final stats
+			this.printStats();
+			this.writeWorkflowOutcome();
+			return { sourceAvailable: !this.sourceUnavailable };
+		} catch (error) {
+			runError = error;
+			throw error;
+		} finally {
+			// Always close the browser, even if an error occurred
+			if (this.browser) {
+				log('\n🌐 Closing browser...', true);
+				await this.browser.close().catch(error => {
+					log(`   ⚠️  Could not close browser: ${error.message}`, true);
+				});
+			}
+			await this.finishDailyRun(runError);
+		}
+	}
+
+	/**
+	 * Print final statistics
+	 */
+	printStats() {
+		log(`\n${'='.repeat(60)}`, true);
+		log('🎉 WEEKLY SCRAPING COMPLETE', true);
+		log(`${'='.repeat(60)}`, true);
+		log(`Total cases checked: ${this.stats.total}`, true);
+		log(`✅ Updated (changed): ${this.stats.updated}`, true);
+		log(`✓ Unchanged: ${this.stats.unchanged}`, true);
+		log(`⚠️  Not found: ${this.stats.notFound}`, true);
+		log(`❌ Errors: ${this.stats.errors}`, true);
+		log(`${'='.repeat(60)}\n`, true);
+	}
+
+	writeWorkflowOutcome() {
+		const sourceAvailable = !this.sourceUnavailable && !this.stats.errors && this.processedCount === this.stats.total;
+		if (process.env.GITHUB_OUTPUT) {
+			fs.appendFileSync(
+				process.env.GITHUB_OUTPUT,
+				`source_available=${sourceAvailable ? 'true' : 'false'}\n`
+			);
+		}
+		if (process.env.DAILY_SOP_OUTCOME_FILE) {
+			fs.writeFileSync(
+				process.env.DAILY_SOP_OUTCOME_FILE,
+				JSON.stringify({ sourceAvailable, stats: this.stats })
+			);
+		}
+	}
+
+	/**
+	 * Sleep helper
+	 */
+	sleep(ms) {
+		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+}
+
+async function main() {
+	// Use dev database for testing
+	// Change to 'echr-db' when ready for production
+	const databaseName = process.env.DATABASE_NAME || 'echr-db';
+
+	console.log(`\n🗄️  Using database: ${databaseName}`);
+
+	const scraper = new WeeklyECHRScraper(databaseName);
+	await scraper.run();
+}
+
+// Run if called directly
+if (require.main === module) {
+	main().catch(error => {
+		console.error('❌ Fatal error:', error);
+		process.exit(1);
+	});
+}
+
+module.exports = { WeeklyECHRScraper };

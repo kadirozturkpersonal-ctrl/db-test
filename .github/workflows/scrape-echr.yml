@@ -1,0 +1,183 @@
+name: ECHR Scraper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: echr-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    # Local Windows tasks exclusively own SOP scraping and the D1 writer.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max - GitHub free tier limit
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify single live D1 target
+        working-directory: ./db-old
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: node d1-target.js
+
+      - name: Install dependencies
+        working-directory: ./db-old
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: ./db-old
+        run: npx playwright install chromium
+
+      - name: Run scraper
+        working-directory: ./db-old
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          MAX_CONSECUTIVE_EMPTY: '500'
+          # Runner/Chromium kapanışında sorun yaşansa bile bir sonraki altı saatlik
+          # slotu ve gece SOP kontrolünü bekletmemek için en fazla dört saat çalışır.
+          MAX_RUNTIME_MINUTES: '240'
+          SAFE_STOP_BUFFER_MINUTES: '15'
+          # Tek bir Playwright isteğinin takılması tüm Actions runner'ını kaybettirmez.
+          SCRAPE_ATTEMPT_TIMEOUT_MS: '45000'
+          BROWSER_MAX_UPTIME_MINUTES: '90'
+          SCRAPER_STATE_FILE: './scraper-state.json'
+          SCRAPER_FAILURE_REPORT_FILE: './scraper-failure.json'
+          D1_COST_REPORT_FILE: './d1-cost-report.json'
+          # Ortak D1 çalışma geçmişinde GitHub koşularını yereldeki tarayıcıdan
+          # ayırır; yalnız yeni kayıtlar etiketlenir, mevcut kayıtlar değişmez.
+          SCRAPER_RUN_SOURCE: 'github-actions'
+          SCRAPER_RUN_SOURCE_REFERENCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCRAPER_SCHEDULE_SLOT: ${{ github.event.schedule == '0 3 * * *' && '06:00' || github.event.schedule == '0 9 * * *' && '12:00' || github.event.schedule == '0 15 * * *' && '18:00' || 'manual' }}
+          # 06:00 Türkiye çalışması, kuyruk/D1 istek kaydı olmadan doğrudan
+          # 2026'nın D1'deki en yüksek numarasından 500 geriden başlar.
+          RUN_CURRENT_YEAR_PRIORITY_SCAN: ${{ github.event.schedule == '0 3 * * *' && 'true' || 'false' }}
+        run: node monthly-scraper.js
+
+      - name: Refresh HukukiPanel AİHM published data
+        id: published_snapshot
+        if: success()
+        env:
+          # Günlük SOP ile aynı, doğrulanmış eski/yeni secret zincirini kullan.
+          # Önceki ECHR_PUBLISHED_REFRESH_* yedeği bu depoda tanımlı değildi;
+          # tarama başarıyla bittiği hâlde adım bu nedenle anında kırmızı oluyordu.
+          ECHR_PUBLISHED_REFRESH_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL || secrets.ECHR_PUBLISHED_REFRESH_URL }}
+          ECHR_PUBLISHED_REFRESH_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET || secrets.ECHR_PUBLISHED_REFRESH_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ECHR_PUBLISHED_REFRESH_URL" ] || [ -z "$ECHR_PUBLISHED_REFRESH_SECRET" ]; then
+            echo "::warning::AİHM yayımlı veri yenilemesi için URL veya yetkilendirme secret'ı yapılandırılmamış. D1 tarama verisi kaydedildi; panel yenilemesi atlandı."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          endpoint="${ECHR_PUBLISHED_REFRESH_URL%/}"
+          case "$endpoint" in
+            */api/*) endpoint="${endpoint%/api/*}/api/echr-db/refresh?wait=1" ;;
+            *) endpoint="$endpoint/api/echr-db/refresh?wait=1" ;;
+          esac
+          # Yeni panel sürümü yayımlanmış özet kullanır. Eski üretim sürümü
+          # ise Cloudflare D1'i doğrudan okur; bu durumda endpointin 404
+          # dönmesi, scraper verisinin görünmediği anlamına gelmez.
+          preflight_status="$(curl --silent --show-error --retry 3 --retry-all-errors --connect-timeout 15 --max-time 30 --output /dev/null --write-out '%{http_code}' "$endpoint" || true)"
+          if [ "$preflight_status" = "404" ]; then
+            echo "::notice::Üretim paneli AİHM verilerini Cloudflare D1'den doğrudan okuyor; özet yenilemesi gerekmiyor."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$preflight_status" != "200" ]; then
+            echo "::warning::AİHM yayımlanmış veri endpointi HTTP $preflight_status döndürdü. D1 tarama verisi kaydedildi; panel yenilemesi sonraki run'da yeniden denenecek."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          response_file="$(mktemp)"
+          set +e
+          response_status="$(curl --silent --show-error --request POST "$endpoint" \
+            --header "Authorization: Bearer $ECHR_PUBLISHED_REFRESH_SECRET" \
+            --header "Content-Type: application/json" --data '{}' \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
+            --output "$response_file" --write-out '%{http_code}')"
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
+            echo "::warning::AİHM yayımlı veri yenilemesi HTTP $response_status ile başarısız oldu. D1 tarama verisi kaydedildi; panel yenilemesi sonraki run'da yeniden denenecek."
+            head -c 2000 "$response_file" || true
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify portfolio stage changes
+        if: success() && steps.published_snapshot.outputs.available == 'true'
+        env:
+          PORTFOLIO_NOTIFICATION_URL: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_URL || secrets.ECHR_STAGE_NOTIFICATION_URL }}
+          PORTFOLIO_NOTIFICATION_SECRET: ${{ secrets.HUMAN_RIGHTS_DAILY_UPDATE_CRON_SECRET || secrets.ECHR_STAGE_NOTIFICATION_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$PORTFOLIO_NOTIFICATION_URL"
+          test -n "$PORTFOLIO_NOTIFICATION_SECRET"
+          endpoint="${PORTFOLIO_NOTIFICATION_URL%/}"
+          case "$endpoint" in
+            */api/*) endpoint="${endpoint%/api/*}/api/echr-db/portfolio-stage-notifications" ;;
+            *) endpoint="$endpoint/api/echr-db/portfolio-stage-notifications" ;;
+          esac
+          response_file="$(mktemp)"
+          set +e
+          response_status="$(curl --silent --show-error --request POST "$endpoint" \
+            --header "Authorization: Bearer $PORTFOLIO_NOTIFICATION_SECRET" \
+            --header "Content-Type: application/json" \
+            --data @db-old/portfolio-stage-changes.json \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+            --output "$response_file" --write-out '%{http_code}')"
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ] || [ "$response_status" -lt 200 ] || [ "$response_status" -ge 300 ]; then
+            echo "::warning::Portföy aşama bildirimi HTTP $response_status ile başarısız oldu. Tarama verisi D1'de korundu; bildirim sonraki run'da yeniden denenecek."
+            head -c 2000 "$response_file" || true
+            exit 0
+          fi
+
+      - name: Persist scraper checkpoint
+        if: always()
+        run: node scripts/persist-scraper-checkpoint.cjs
+
+      - name: Preserve recoverable scraper checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-checkpoint-${{ github.run_id }}
+          path: db-old/scraper-state.json
+          retention-days: 31
+
+      - name: Upload scraper failure report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-failure-report
+          path: db-old/scraper-failure.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve measured D1 query costs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-query-costs-${{ github.run_id }}
+          path: db-old/d1-cost-report.*.json
+          if-no-files-found: ignore
+          retention-days: 31
